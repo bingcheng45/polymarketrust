@@ -23,6 +23,7 @@ use crate::ws_client::WsClient;
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -81,6 +82,9 @@ pub struct MarketMonitor {
 
     // Errors collected for session summary
     errors: Vec<String>,
+
+    // Prevents concurrent Safe redemptions (same nonce → "already known" mempool error)
+    is_redeeming: Arc<AtomicBool>,
 }
 
 impl MarketMonitor {
@@ -117,6 +121,7 @@ impl MarketMonitor {
             last_merge_attempt: None,
             last_check: None,
             errors: Vec::new(),
+            is_redeeming: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -169,6 +174,14 @@ impl MarketMonitor {
 
         // 6. Refresh gas cache
         self.refresh_gas_cache().await;
+
+        // 7. Ensure CTF approvals for Gnosis Safe (SIGNATURE_TYPE=2)
+        if self.config.uses_proxy() && !self.config.mock_currency {
+            let rpc = "https://polygon-rpc.com";
+            if let Err(e) = self.client.ensure_ctf_approvals(rpc).await {
+                warn!("CTF approval check failed (continuing): {e}");
+            }
+        }
 
         self.log("Initialization complete").await;
         Ok(())
@@ -897,6 +910,33 @@ impl MarketMonitor {
             .min(self.position.yes_size)
             .min(self.position.no_size);
 
+        // ── Relayer delay guard ───────────────────────────────────────────────
+        // Polymarket's fill relayer can take a few seconds to settle CTF tokens
+        // on-chain.  If we call mergePositions before the balance appears, the
+        // transaction reverts.  Check actual on-chain balances first; if zero,
+        // defer and retry in MERGE_RETRY_SECS without touching in-memory state.
+        if !self.config.mock_currency {
+            let rpc = "https://polygon-rpc.com";
+            let holder = self.client.maker_address();
+            let yes_on_chain = self
+                .client
+                .get_ctf_balance(&mi.tokens.yes, holder, rpc)
+                .await
+                .unwrap_or(0.0);
+            let no_on_chain = self
+                .client
+                .get_ctf_balance(&mi.tokens.no, holder, rpc)
+                .await
+                .unwrap_or(0.0);
+            if yes_on_chain.min(no_on_chain) < 0.01 {
+                warn!(
+                    "Merge deferred: CTF tokens not yet on-chain \
+                     (YES={yes_on_chain:.4}, NO={no_on_chain:.4}) — relayer delay"
+                );
+                return; // last_merge_attempt set; retry after MERGE_RETRY_SECS
+            }
+        }
+
         // Reduce in-memory position immediately (optimistic update)
         self.position.yes_size -= capped;
         self.position.no_size -= capped;
@@ -983,6 +1023,15 @@ impl MarketMonitor {
             return;
         }
 
+        // Gnosis Safe: prevent concurrent redemptions — the Safe nonce is shared,
+        // so two simultaneous execTransaction calls with the same nonce produce an
+        // "already known" mempool error.  We use an AtomicBool flag and reset it
+        // inside the spawned task once the redemption completes.
+        if self.is_redeeming.load(Ordering::Relaxed) {
+            debug!("Redemption already in progress — skipping");
+            return;
+        }
+
         let rpcs = [
             "https://polygon-rpc.com",
             "https://polygon.llamarpc.com",
@@ -1027,6 +1076,10 @@ impl MarketMonitor {
             let cid = condition_id.clone();
             let question = mi.question.clone();
             let redeemable = yes_bal.max(no_bal);
+            let is_redeeming_flag = Arc::clone(&self.is_redeeming);
+
+            // Mark redemption as in-flight before spawning
+            is_redeeming_flag.store(true, Ordering::Relaxed);
 
             tokio::spawn(async move {
                 let rpcs = [
@@ -1040,14 +1093,24 @@ impl MarketMonitor {
                             info!("Redemption confirmed: {redeemable:.2} | tx={tx:?}");
                             if let Ok(logger) = crate::trade_logger::TradeLogger::new().await {
                                 logger
-                                    .log_redemption(&cid, Some(&question), redeemable, redeemable, true, None)
+                                    .log_redemption(
+                                        &cid,
+                                        Some(&question),
+                                        redeemable,
+                                        redeemable,
+                                        true,
+                                        None,
+                                    )
                                     .await;
                             }
+                            is_redeeming_flag.store(false, Ordering::Relaxed);
                             return;
                         }
                         Err(e) => warn!("Redemption failed on {rpc}: {e}"),
                     }
                 }
+                // All RPCs failed — reset flag so we can retry next cycle
+                is_redeeming_flag.store(false, Ordering::Relaxed);
             });
 
             // Remove from tracking after dispatching redemption

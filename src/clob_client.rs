@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
@@ -653,11 +653,10 @@ impl ClobClient {
 
     // ─── On-chain Contract Calls ──────────────────────────────────────────────
 
-    /// Call `mergePositions` on the CTF Exchange to burn YES + NO shares → USDC.
+    /// Burns YES + NO shares → USDC by calling `mergePositions` on the CTF Exchange.
     ///
-    /// This replicates the TypeScript `mergeBalancedPosition()` call via ethers.
-    /// `amount` is in shares (will be converted to 1e6 units).
-    /// Returns the transaction hash on success.
+    /// Supports both EOA (SIGNATURE_TYPE=0) and Gnosis Safe (SIGNATURE_TYPE=2).
+    /// `amount` is in shares; internally converted to 1e6 units (USDC precision).
     pub async fn merge_positions(
         &self,
         condition_id: &str,
@@ -665,17 +664,8 @@ impl ClobClient {
         neg_risk: bool,
         rpc_url: &str,
     ) -> Result<H256> {
-        use ethers::providers::{Http, Provider};
-        use ethers::middleware::SignerMiddleware;
-        use ethers::abi::{encode as abi_encode, Token};
-
-        let provider = Provider::<Http>::try_from(rpc_url)?;
-        let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
-
-        // amount in 1e6 units (CTF uses 1e6 precision)
         let amount_u256 = U256::from((amount * 1_000_000.0).floor() as u128);
 
-        // condition_id is a bytes32 hex string
         let condition_bytes: [u8; 32] = {
             let clean = condition_id.trim_start_matches("0x");
             let mut arr = [0u8; 32];
@@ -683,26 +673,6 @@ impl ClobClient {
             arr[..decoded.len()].copy_from_slice(&decoded);
             arr
         };
-
-        // mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint[] partition, uint amount)
-        // Polymarket uses a 2-outcome partition: [1, 2]
-        let partition = vec![U256::one(), U256::from(2u64)];
-        let parent_collection_id = [0u8; 32]; // zero bytes
-
-        // Encode the call manually (ABI encoding of mergePositions)
-        let function_selector = &keccak256("mergePositions(address,bytes32,bytes32,uint256[],uint256)")[..4];
-
-        let encoded_params = abi_encode(&[
-            Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
-            Token::FixedBytes(parent_collection_id.to_vec()),
-            Token::FixedBytes(condition_bytes.to_vec()),
-            Token::Array(partition.into_iter().map(Token::Uint).collect()),
-            Token::Uint(amount_u256),
-        ]);
-
-        let mut calldata = Vec::with_capacity(4 + encoded_params.len());
-        calldata.extend_from_slice(function_selector);
-        calldata.extend_from_slice(&encoded_params);
 
         let contract_addr: Address = if neg_risk {
             NEG_RISK_CTF_EXCHANGE.parse().unwrap()
@@ -710,34 +680,62 @@ impl ClobClient {
             CTF_EXCHANGE.parse().unwrap()
         };
 
-        let tx = ethers::types::TransactionRequest::new()
-            .to(contract_addr)
-            .data(calldata)
-            .from(self.signer_address);
+        // mergePositions(address,bytes32,bytes32,uint256[],uint256)
+        let inner_calldata = encode_calldata(
+            "mergePositions(address,bytes32,bytes32,uint256[],uint256)",
+            &[
+                Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
+                Token::FixedBytes([0u8; 32].to_vec()),  // parentCollectionId = zero
+                Token::FixedBytes(condition_bytes.to_vec()),
+                Token::Array(
+                    vec![U256::one(), U256::from(2u64)]
+                        .into_iter()
+                        .map(Token::Uint)
+                        .collect(),
+                ),
+                Token::Uint(amount_u256),
+            ],
+        );
 
-        let pending = client.send_transaction(tx, None).await?;
-        let receipt = pending
-            .await?
-            .context("mergePositions: transaction dropped")?;
-
-        Ok(receipt.transaction_hash)
+        if self.config.uses_proxy() {
+            // ── Gnosis Safe path ──────────────────────────────────────────────
+            let safe_addr: Address = self
+                .config
+                .poly_proxy_address
+                .as_deref()
+                .unwrap()
+                .parse()
+                .context("Invalid POLY_PROXY_ADDRESS")?;
+            self.safe_exec_transaction(safe_addr, contract_addr, inner_calldata, 500_000, rpc_url)
+                .await
+        } else {
+            // ── EOA path ─────────────────────────────────────────────────────
+            use ethers::middleware::SignerMiddleware;
+            use ethers::providers::{Http, Provider};
+            let provider = Provider::<Http>::try_from(rpc_url)?;
+            let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
+            let tx = ethers::types::TransactionRequest::new()
+                .to(contract_addr)
+                .data(inner_calldata)
+                .from(self.signer_address);
+            let pending = client.send_transaction(tx, None).await?;
+            let receipt = pending
+                .await?
+                .context("mergePositions: transaction dropped")?;
+            Ok(receipt.transaction_hash)
+        }
     }
 
-    /// Call `redeemPositions` on the Conditional Tokens contract to claim USDC from
-    /// a resolved market.  `index_sets` is typically `[1, 2]` for a 2-outcome market.
+    /// Claims USDC from a resolved market by calling `redeemPositions` on the CTF contract.
+    ///
+    /// `index_sets` is typically `[1, 2]` for a standard 2-outcome market.
+    /// Supports both EOA and Gnosis Safe paths.
     pub async fn redeem_positions(
         &self,
         condition_id: &str,
         index_sets: &[U256],
         rpc_url: &str,
     ) -> Result<H256> {
-        use ethers::providers::{Http, Provider};
-        use ethers::middleware::SignerMiddleware;
-        use ethers::abi::{encode as abi_encode, Token};
-
-        let provider = Provider::<Http>::try_from(rpc_url)?;
-        let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
-
         let condition_bytes: [u8; 32] = {
             let clean = condition_id.trim_start_matches("0x");
             let mut arr = [0u8; 32];
@@ -746,61 +744,58 @@ impl ClobClient {
             arr
         };
 
-        let parent_collection_id = [0u8; 32];
-
-        // redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)
-        let function_selector =
-            &keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[..4];
-
-        let encoded_params = abi_encode(&[
-            Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
-            Token::FixedBytes(parent_collection_id.to_vec()),
-            Token::FixedBytes(condition_bytes.to_vec()),
-            Token::Array(index_sets.iter().cloned().map(Token::Uint).collect()),
-        ]);
-
-        let mut calldata = Vec::with_capacity(4 + encoded_params.len());
-        calldata.extend_from_slice(function_selector);
-        calldata.extend_from_slice(&encoded_params);
-
         let ctf_addr: Address = CONDITIONAL_TOKENS.parse().unwrap();
 
-        let tx = ethers::types::TransactionRequest::new()
-            .to(ctf_addr)
-            .data(calldata)
-            .from(self.signer_address);
+        // redeemPositions(address,bytes32,bytes32,uint256[])
+        let inner_calldata = encode_calldata(
+            "redeemPositions(address,bytes32,bytes32,uint256[])",
+            &[
+                Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
+                Token::FixedBytes([0u8; 32].to_vec()),
+                Token::FixedBytes(condition_bytes.to_vec()),
+                Token::Array(index_sets.iter().cloned().map(Token::Uint).collect()),
+            ],
+        );
 
-        let pending = client.send_transaction(tx, None).await?;
-        let receipt = pending
-            .await?
-            .context("redeemPositions: transaction dropped")?;
-
-        Ok(receipt.transaction_hash)
+        if self.config.uses_proxy() {
+            let safe_addr: Address = self
+                .config
+                .poly_proxy_address
+                .as_deref()
+                .unwrap()
+                .parse()
+                .context("Invalid POLY_PROXY_ADDRESS")?;
+            self.safe_exec_transaction(safe_addr, ctf_addr, inner_calldata, 500_000, rpc_url)
+                .await
+        } else {
+            use ethers::middleware::SignerMiddleware;
+            use ethers::providers::{Http, Provider};
+            let provider = Provider::<Http>::try_from(rpc_url)?;
+            let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
+            let tx = ethers::types::TransactionRequest::new()
+                .to(ctf_addr)
+                .data(inner_calldata)
+                .from(self.signer_address);
+            let pending = client.send_transaction(tx, None).await?;
+            let receipt = pending
+                .await?
+                .context("redeemPositions: transaction dropped")?;
+            Ok(receipt.transaction_hash)
+        }
     }
 
-    /// Check on-chain CTF token balance for a given token ID and holder address.
+    /// Check on-chain CTF ERC-1155 token balance for a given token ID and holder.
     pub async fn get_ctf_balance(
         &self,
         token_id: &str,
         holder: Address,
         rpc_url: &str,
     ) -> Result<f64> {
-        use ethers::providers::{Http, Provider};
-        use ethers::abi::{encode as abi_encode, Token};
-
-        let provider = Provider::<Http>::try_from(rpc_url)?;
-
-        // balanceOf(address account, uint256 id)
-        let function_selector = &keccak256("balanceOf(address,uint256)")[..4];
         let token_id_u256 = parse_token_id(token_id)?;
-
-        let encoded = abi_encode(&[
-            Token::Address(holder),
-            Token::Uint(token_id_u256),
-        ]);
-        let mut calldata = Vec::with_capacity(4 + encoded.len());
-        calldata.extend_from_slice(function_selector);
-        calldata.extend_from_slice(&encoded);
+        let calldata = encode_calldata(
+            "balanceOf(address,uint256)",
+            &[Token::Address(holder), Token::Uint(token_id_u256)],
+        );
 
         let call_hex = format!("0x{}", hex::encode(&calldata));
         let body = json!({
@@ -817,14 +812,194 @@ impl ClobClient {
             .and_then(|x| x.as_str())
             .unwrap_or("0x0");
         let clean = hex_result.trim_start_matches("0x");
-        let raw = u128::from_str_radix(if clean.is_empty() { "0" } else { clean }, 16)
-            .unwrap_or(0);
+        let raw =
+            u128::from_str_radix(if clean.is_empty() { "0" } else { clean }, 16).unwrap_or(0);
 
         Ok(raw as f64 / 1_000_000.0)
+    }
+
+    /// Ensure the Gnosis Safe has `setApprovalForAll` granted to all three CTF operators.
+    ///
+    /// Should be called once during bot initialization when SIGNATURE_TYPE=2.
+    /// Already-approved operators are skipped to avoid wasting gas.
+    pub async fn ensure_ctf_approvals(&self, rpc_url: &str) -> Result<()> {
+        if !self.config.uses_proxy() {
+            return Ok(());
+        }
+
+        let safe_addr: Address = self
+            .config
+            .poly_proxy_address
+            .as_deref()
+            .unwrap()
+            .parse()
+            .context("Invalid POLY_PROXY_ADDRESS")?;
+
+        let ctf_addr: Address = CONDITIONAL_TOKENS.parse().unwrap();
+
+        let operators: &[(&str, &str)] = &[
+            ("CTF Exchange", CTF_EXCHANGE),
+            ("NegRisk CTF Exchange", NEG_RISK_CTF_EXCHANGE),
+            ("NegRisk Adapter", NEG_RISK_ADAPTER),
+        ];
+
+        for (name, operator_str) in operators {
+            let operator: Address = operator_str.parse().unwrap();
+
+            let already_approved = self
+                .check_ctf_approval(safe_addr, operator, rpc_url)
+                .await
+                .unwrap_or(false);
+
+            if already_approved {
+                info!("CTF operator already approved: {name}");
+                continue;
+            }
+
+            info!("Granting CTF setApprovalForAll to {name} via Safe...");
+
+            // setApprovalForAll(address operator, bool approved)
+            let calldata = encode_calldata(
+                "setApprovalForAll(address,bool)",
+                &[Token::Address(operator), Token::Bool(true)],
+            );
+
+            self.safe_exec_transaction(safe_addr, ctf_addr, calldata, 200_000, rpc_url)
+                .await?;
+
+            info!("CTF approval granted to {name}");
+        }
+
+        Ok(())
+    }
+
+    /// Query `isApprovedForAll(account, operator)` on the CTF contract.
+    async fn check_ctf_approval(
+        &self,
+        account: Address,
+        operator: Address,
+        rpc_url: &str,
+    ) -> Result<bool> {
+        let calldata = encode_calldata(
+            "isApprovedForAll(address,address)",
+            &[Token::Address(account), Token::Address(operator)],
+        );
+
+        let call_hex = format!("0x{}", hex::encode(&calldata));
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": CONDITIONAL_TOKENS, "data": call_hex}, "latest"],
+            "id": 1
+        });
+
+        let resp = self.http.post(rpc_url).json(&body).send().await?;
+        let v: Value = resp.json().await?;
+        let hex_result = v
+            .get("result")
+            .and_then(|x| x.as_str())
+            .unwrap_or("0x0");
+        let clean = hex_result.trim_start_matches("0x");
+        let val =
+            u128::from_str_radix(if clean.is_empty() { "0" } else { clean }, 16).unwrap_or(0);
+
+        Ok(val != 0)
+    }
+
+    /// Execute a call through the Gnosis Safe using a pre-validated signature.
+    ///
+    /// The EOA (`self.signer_address`) must already be a registered owner of the Safe.
+    /// Uses a legacy (type-0) transaction with an explicit gas limit + 20%-buffered gas price.
+    ///
+    /// Replicates the TypeScript pattern:
+    ///   `safe.execTransaction(to, 0, data, 0, 0, 0, 0, addr0, addr0, signatures)`
+    async fn safe_exec_transaction(
+        &self,
+        safe_addr: Address,
+        target: Address,
+        inner_calldata: Vec<u8>,
+        gas_limit: u64,
+        rpc_url: &str,
+    ) -> Result<H256> {
+        use ethers::middleware::SignerMiddleware;
+        use ethers::providers::{Http, Provider};
+
+        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let signer_client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
+
+        // Fetch live gas price and add 20% buffer
+        let gas_price_gwei = self.get_gas_price_gwei().await;
+        let gas_price_wei = U256::from(((gas_price_gwei * 1.2) * 1e9) as u64);
+
+        // Pre-validated signature: uint256(signerAddr) ‖ uint256(0) ‖ uint8(1)
+        let sigs = pre_validated_signature(self.signer_address);
+
+        // execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)
+        let exec_selector = &keccak256(
+            b"execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
+        )[..4];
+
+        let encoded_params = abi_encode(&[
+            Token::Address(target),
+            Token::Uint(U256::zero()),       // value
+            Token::Bytes(inner_calldata),    // data
+            Token::Uint(U256::zero()),       // operation = 0 (CALL)
+            Token::Uint(U256::zero()),       // safeTxGas  (0 = use all forwarded gas)
+            Token::Uint(U256::zero()),       // baseGas
+            Token::Uint(U256::zero()),       // gasPrice in Safe (0 = no refund)
+            Token::Address(Address::zero()), // gasToken
+            Token::Address(Address::zero()), // refundReceiver
+            Token::Bytes(sigs),             // signatures
+        ]);
+
+        let mut exec_calldata = Vec::with_capacity(4 + encoded_params.len());
+        exec_calldata.extend_from_slice(exec_selector);
+        exec_calldata.extend_from_slice(&encoded_params);
+
+        let tx = ethers::types::TransactionRequest::new()
+            .to(safe_addr)
+            .data(exec_calldata)
+            .from(self.signer_address)
+            .gas(gas_limit)
+            .gas_price(gas_price_wei);
+
+        let pending = signer_client.send_transaction(tx, None).await?;
+        let receipt = pending
+            .await?
+            .context("Gnosis Safe execTransaction: tx dropped from mempool")?;
+
+        Ok(receipt.transaction_hash)
     }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Build raw calldata: 4-byte function selector + ABI-encoded parameters.
+fn encode_calldata(sig: &str, tokens: &[Token]) -> Vec<u8> {
+    let selector = &keccak256(sig.as_bytes())[..4];
+    let encoded = abi_encode(tokens);
+    let mut data = Vec::with_capacity(4 + encoded.len());
+    data.extend_from_slice(selector);
+    data.extend_from_slice(&encoded);
+    data
+}
+
+/// Build a Gnosis Safe "pre-validated signature".
+///
+/// Layout: uint256(signerAddress) ‖ uint256(0) ‖ uint8(1) = 65 bytes total.
+/// - Bytes  0-31: signer address right-aligned in a 32-byte word (12 zero bytes + 20-byte addr)
+/// - Bytes 32-63: zero  (s = 0)
+/// - Byte    64:  0x01  (v = 1 = pre-validated, not an ECDSA sig)
+///
+/// This tells the Safe that `signerAddress` (an on-chain registered owner) approves
+/// the transaction without requiring a live ECDSA signature.
+fn pre_validated_signature(signer: Address) -> Vec<u8> {
+    let mut sig = vec![0u8; 65];
+    sig[12..32].copy_from_slice(signer.as_bytes()); // right-align address in first 32 bytes
+    // bytes 32-63 already zero (s = 0)
+    sig[64] = 1u8; // v = 1 (pre-validated)
+    sig
+}
 
 /// Parse a token ID that might be decimal or hex.
 fn parse_token_id(token_id: &str) -> Result<U256> {
