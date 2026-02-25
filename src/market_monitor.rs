@@ -882,49 +882,176 @@ impl MarketMonitor {
 
     // ─── Merge ─────────────────────────────────────────────────────────────────
 
+    /// Burns YES + NO shares on-chain → releases USDC.
+    /// Fire-and-forget: spawns a background task so it never blocks the hot path.
+    /// Replicates TypeScript `mergeBalancedPosition()`.
     async fn fire_merge(&mut self, amount: f64, mi: &MarketInfo) {
-        if amount < 0.01 || self.config.mock_currency {
+        if amount < 0.01 {
             return;
         }
 
         self.last_merge_attempt = Some(Instant::now());
 
-        // Merge is fire-and-forget so it doesn't block the hot path
-        let condition_id = mi.condition_id.clone();
-        let question = mi.question.clone();
-        let _config = Arc::clone(&self.config);
+        // Cap to actual position
+        let capped = amount
+            .min(self.position.yes_size)
+            .min(self.position.no_size);
 
-        // Reduce position trackers
-        let capped = amount.min(self.position.yes_size).min(self.position.no_size);
+        // Reduce in-memory position immediately (optimistic update)
         self.position.yes_size -= capped;
         self.position.no_size -= capped;
-        self.session_locked_value += capped * 1.0; // Value locked pending on-chain
+        self.session_locked_value += capped; // USDC value locked until merge confirms
 
-        info!("Merging {capped:.2} YES+NO → USDC (fire-and-forget)");
+        let condition_id = mi.condition_id.clone();
+        let question = mi.question.clone();
+        let neg_risk = mi.neg_risk;
 
-        // In a production implementation, this would call the on-chain
-        // mergePositions function on the CTF Exchange contract.
-        // For completeness, we log the intent here. Actual ethers-rs
-        // contract call would be wired in the on_chain module.
-        self.trade_logger
-            .log_merge(&condition_id, Some(&question), capped, true, None)
-            .await;
+        if self.config.mock_currency {
+            // Mock mode — just log, no on-chain call
+            info!("[MOCK] Merged {capped:.2} YES+NO → USDC");
+            self.trade_logger
+                .log_merge(&condition_id, Some(&question), capped, true, None)
+                .await;
+            self.session_locked_value -= capped;
+            return;
+        }
 
-        self.session_locked_value -= capped * 1.0; // Resolved
+        info!("Merging {capped:.2} YES+NO → USDC (on-chain, fire-and-forget)");
+
+        let client = Arc::clone(&self.client);
+        let trade_logger_path = "logs/trades.jsonl".to_string(); // Re-create to avoid borrow
+        let locked_ref = self.session_locked_value; // snapshot — background task won't mutate shared state
+
+        tokio::spawn(async move {
+            // Try Polygon RPC providers in order
+            let rpcs = [
+                "https://polygon-rpc.com",
+                "https://polygon.llamarpc.com",
+                "https://rpc.ankr.com/polygon",
+            ];
+
+            let mut last_err = None;
+            for rpc in &rpcs {
+                match client
+                    .merge_positions(&condition_id, capped, neg_risk, rpc)
+                    .await
+                {
+                    Ok(tx_hash) => {
+                        info!(
+                            "Merge confirmed: {:.2} shares → USDC | tx={tx_hash:?}",
+                            capped
+                        );
+                        // Log success
+                        if let Ok(logger) = crate::trade_logger::TradeLogger::new().await {
+                            logger
+                                .log_merge(&condition_id, Some(&question), capped, true, None)
+                                .await;
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("Merge failed on {rpc}: {e}");
+                        last_err = Some(e);
+                    }
+                }
+            }
+
+            // All RPCs failed
+            if let Some(e) = last_err {
+                warn!("Merge exhausted all RPCs: {e}");
+                if let Ok(logger) = crate::trade_logger::TradeLogger::new().await {
+                    logger
+                        .log_merge(
+                            &condition_id,
+                            Some(&question),
+                            capped,
+                            false,
+                            Some(e.to_string()),
+                        )
+                        .await;
+                }
+            }
+        });
     }
 
     // ─── Redemption ────────────────────────────────────────────────────────────
 
+    /// Redeem winnings from resolved markets.
+    /// Replicates TypeScript `redeemResolvedPositions()`.
     pub async fn redeem_resolved_positions(&mut self) {
         if self.config.mock_currency || self.active_assets.is_empty() {
             return;
         }
 
+        let rpcs = [
+            "https://polygon-rpc.com",
+            "https://polygon.llamarpc.com",
+            "https://rpc.ankr.com/polygon",
+        ];
+        let rpc = rpcs[0]; // Use primary; fallback would require cloning client
+
         let assets: Vec<String> = self.active_assets.iter().cloned().collect();
+        let holder = self.client.maker_address();
+
         for condition_id in &assets {
-            // Check if market is resolved and we have balance
-            // (Full on-chain implementation would call redeemPositions)
-            info!("Checking redemption for {condition_id}");
+            // Check YES token balance via on-chain balanceOf
+            let mi = match self.market_info.as_ref() {
+                Some(m) if m.condition_id == *condition_id => m.clone(),
+                _ => continue,
+            };
+
+            // Check if we hold any CTF balance for either outcome
+            let yes_bal = self
+                .client
+                .get_ctf_balance(&mi.tokens.yes, holder, rpc)
+                .await
+                .unwrap_or(0.0);
+            let no_bal = self
+                .client
+                .get_ctf_balance(&mi.tokens.no, holder, rpc)
+                .await
+                .unwrap_or(0.0);
+
+            if yes_bal < 0.01 && no_bal < 0.01 {
+                // No balance — market either not resolved or already redeemed
+                continue;
+            }
+
+            info!(
+                "Redeeming {condition_id}: YES={yes_bal:.2} NO={no_bal:.2}"
+            );
+
+            // redeemPositions with full partition [1, 2]
+            let index_sets = vec![ethers::types::U256::one(), ethers::types::U256::from(2u64)];
+            let client = Arc::clone(&self.client);
+            let cid = condition_id.clone();
+            let question = mi.question.clone();
+            let redeemable = yes_bal.max(no_bal);
+
+            tokio::spawn(async move {
+                let rpcs = [
+                    "https://polygon-rpc.com",
+                    "https://polygon.llamarpc.com",
+                    "https://rpc.ankr.com/polygon",
+                ];
+                for rpc in &rpcs {
+                    match client.redeem_positions(&cid, &index_sets, rpc).await {
+                        Ok(tx) => {
+                            info!("Redemption confirmed: {redeemable:.2} | tx={tx:?}");
+                            if let Ok(logger) = crate::trade_logger::TradeLogger::new().await {
+                                logger
+                                    .log_redemption(&cid, Some(&question), redeemable, redeemable, true, None)
+                                    .await;
+                            }
+                            return;
+                        }
+                        Err(e) => warn!("Redemption failed on {rpc}: {e}"),
+                    }
+                }
+            });
+
+            // Remove from tracking after dispatching redemption
+            self.active_assets.remove(condition_id);
         }
     }
 

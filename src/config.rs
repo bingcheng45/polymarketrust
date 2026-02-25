@@ -48,7 +48,7 @@ impl Config {
         let poly_proxy_address = env::var("POLY_PROXY_ADDRESS").ok().filter(|s| !s.is_empty());
 
         let signature_type: u8 = env::var("SIGNATURE_TYPE")
-            .unwrap_or_else(|_| "1".to_string())
+            .unwrap_or_else(|_| "0".to_string())
             .parse()
             .context("SIGNATURE_TYPE must be 0, 1, or 2")?;
 

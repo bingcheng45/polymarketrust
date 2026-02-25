@@ -650,6 +650,178 @@ impl ClobClient {
 
         30.0 // Fallback: 30 Gwei
     }
+
+    // ─── On-chain Contract Calls ──────────────────────────────────────────────
+
+    /// Call `mergePositions` on the CTF Exchange to burn YES + NO shares → USDC.
+    ///
+    /// This replicates the TypeScript `mergeBalancedPosition()` call via ethers.
+    /// `amount` is in shares (will be converted to 1e6 units).
+    /// Returns the transaction hash on success.
+    pub async fn merge_positions(
+        &self,
+        condition_id: &str,
+        amount: f64,
+        neg_risk: bool,
+        rpc_url: &str,
+    ) -> Result<H256> {
+        use ethers::providers::{Http, Provider};
+        use ethers::middleware::SignerMiddleware;
+        use ethers::abi::{encode as abi_encode, Token};
+
+        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
+
+        // amount in 1e6 units (CTF uses 1e6 precision)
+        let amount_u256 = U256::from((amount * 1_000_000.0).floor() as u128);
+
+        // condition_id is a bytes32 hex string
+        let condition_bytes: [u8; 32] = {
+            let clean = condition_id.trim_start_matches("0x");
+            let mut arr = [0u8; 32];
+            let decoded = hex::decode(clean).context("Invalid condition_id")?;
+            arr[..decoded.len()].copy_from_slice(&decoded);
+            arr
+        };
+
+        // mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint[] partition, uint amount)
+        // Polymarket uses a 2-outcome partition: [1, 2]
+        let partition = vec![U256::one(), U256::from(2u64)];
+        let parent_collection_id = [0u8; 32]; // zero bytes
+
+        // Encode the call manually (ABI encoding of mergePositions)
+        let function_selector = &keccak256("mergePositions(address,bytes32,bytes32,uint256[],uint256)")[..4];
+
+        let encoded_params = abi_encode(&[
+            Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
+            Token::FixedBytes(parent_collection_id.to_vec()),
+            Token::FixedBytes(condition_bytes.to_vec()),
+            Token::Array(partition.into_iter().map(Token::Uint).collect()),
+            Token::Uint(amount_u256),
+        ]);
+
+        let mut calldata = Vec::with_capacity(4 + encoded_params.len());
+        calldata.extend_from_slice(function_selector);
+        calldata.extend_from_slice(&encoded_params);
+
+        let contract_addr: Address = if neg_risk {
+            NEG_RISK_CTF_EXCHANGE.parse().unwrap()
+        } else {
+            CTF_EXCHANGE.parse().unwrap()
+        };
+
+        let tx = ethers::types::TransactionRequest::new()
+            .to(contract_addr)
+            .data(calldata)
+            .from(self.signer_address);
+
+        let pending = client.send_transaction(tx, None).await?;
+        let receipt = pending
+            .await?
+            .context("mergePositions: transaction dropped")?;
+
+        Ok(receipt.transaction_hash)
+    }
+
+    /// Call `redeemPositions` on the Conditional Tokens contract to claim USDC from
+    /// a resolved market.  `index_sets` is typically `[1, 2]` for a 2-outcome market.
+    pub async fn redeem_positions(
+        &self,
+        condition_id: &str,
+        index_sets: &[U256],
+        rpc_url: &str,
+    ) -> Result<H256> {
+        use ethers::providers::{Http, Provider};
+        use ethers::middleware::SignerMiddleware;
+        use ethers::abi::{encode as abi_encode, Token};
+
+        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
+
+        let condition_bytes: [u8; 32] = {
+            let clean = condition_id.trim_start_matches("0x");
+            let mut arr = [0u8; 32];
+            let decoded = hex::decode(clean).context("Invalid condition_id")?;
+            arr[..decoded.len()].copy_from_slice(&decoded);
+            arr
+        };
+
+        let parent_collection_id = [0u8; 32];
+
+        // redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)
+        let function_selector =
+            &keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[..4];
+
+        let encoded_params = abi_encode(&[
+            Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
+            Token::FixedBytes(parent_collection_id.to_vec()),
+            Token::FixedBytes(condition_bytes.to_vec()),
+            Token::Array(index_sets.iter().cloned().map(Token::Uint).collect()),
+        ]);
+
+        let mut calldata = Vec::with_capacity(4 + encoded_params.len());
+        calldata.extend_from_slice(function_selector);
+        calldata.extend_from_slice(&encoded_params);
+
+        let ctf_addr: Address = CONDITIONAL_TOKENS.parse().unwrap();
+
+        let tx = ethers::types::TransactionRequest::new()
+            .to(ctf_addr)
+            .data(calldata)
+            .from(self.signer_address);
+
+        let pending = client.send_transaction(tx, None).await?;
+        let receipt = pending
+            .await?
+            .context("redeemPositions: transaction dropped")?;
+
+        Ok(receipt.transaction_hash)
+    }
+
+    /// Check on-chain CTF token balance for a given token ID and holder address.
+    pub async fn get_ctf_balance(
+        &self,
+        token_id: &str,
+        holder: Address,
+        rpc_url: &str,
+    ) -> Result<f64> {
+        use ethers::providers::{Http, Provider};
+        use ethers::abi::{encode as abi_encode, Token};
+
+        let provider = Provider::<Http>::try_from(rpc_url)?;
+
+        // balanceOf(address account, uint256 id)
+        let function_selector = &keccak256("balanceOf(address,uint256)")[..4];
+        let token_id_u256 = parse_token_id(token_id)?;
+
+        let encoded = abi_encode(&[
+            Token::Address(holder),
+            Token::Uint(token_id_u256),
+        ]);
+        let mut calldata = Vec::with_capacity(4 + encoded.len());
+        calldata.extend_from_slice(function_selector);
+        calldata.extend_from_slice(&encoded);
+
+        let call_hex = format!("0x{}", hex::encode(&calldata));
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": CONDITIONAL_TOKENS, "data": call_hex}, "latest"],
+            "id": 1
+        });
+
+        let resp = self.http.post(rpc_url).json(&body).send().await?;
+        let v: Value = resp.json().await?;
+        let hex_result = v
+            .get("result")
+            .and_then(|x| x.as_str())
+            .unwrap_or("0x0");
+        let clean = hex_result.trim_start_matches("0x");
+        let raw = u128::from_str_radix(if clean.is_empty() { "0" } else { clean }, 16)
+            .unwrap_or(0);
+
+        Ok(raw as f64 / 1_000_000.0)
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
