@@ -1,0 +1,71 @@
+[package]
+name = "polymarketrust"
+version = "0.1.0"
+edition = "2021"
+description = "Polymarket arbitrage bot - Rust implementation"
+authors = ["bingcheng45"]
+
+[lib]
+name = "polymarketrust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "polymarketrust"
+path = "src/main.rs"
+
+[[bin]]
+name = "biogen"
+path = "src/bin/biogen.rs"
+
+[[bin]]
+name = "check_proxy"
+path = "src/bin/check_proxy.rs"
+
+[[bin]]
+name = "test_order"
+path = "src/bin/test_order.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Environment
+dotenv = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Ethereum / Polygon (valid features for ethers v2)
+ethers = { version = "2", features = ["rustls", "abigen"] }
+
+# Cryptography (for CLOB API auth)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

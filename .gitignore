@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Environment (contains private keys!)
+.env
+
+# Logs
+/logs/*.txt
+/logs/*.jsonl
+/logs/*.json
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# macOS
+.DS_Store
