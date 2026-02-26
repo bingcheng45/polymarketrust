@@ -109,6 +109,8 @@ pub struct ClobClient {
 
 impl ClobClient {
     pub async fn new(config: Arc<Config>) -> Result<Self> {
+        crate::init_rustls_provider();
+
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -335,12 +337,14 @@ impl ClobClient {
     }
 
     pub async fn get_balance(&self) -> Result<f64> {
+        const USDC_MICRO_UNITS: f64 = 1_000_000.0;
         let req = BalanceAllowanceRequest::builder().asset_type(AssetType::Collateral).build();
         let resp = self.sdk_client.balance_allowance(req).await?;
         let balance_str = resp.balance.to_string();
-        let f = balance_str.parse::<f64>().unwrap_or(0.0);
-        info!("Balance: raw='{}' → ${:.6}", balance_str, f);
-        Ok(f)
+        let raw = balance_str.parse::<f64>().unwrap_or(0.0);
+        let usdc = raw / USDC_MICRO_UNITS;
+        info!("Balance: raw='{}' micro-USDC → ${:.6}", balance_str, usdc);
+        Ok(usdc)
     }
 
     pub async fn get_trades(&self, condition_id: Option<&str>) -> Result<Vec<TradeRecord>> {

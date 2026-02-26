@@ -14,15 +14,15 @@ use polymarket_client_sdk::error::Error as SdkError;
 use polymarket_client_sdk::types::{Address, U256};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{info, warn};
 
-/// Books older than this are considered stale (WS-primary fetch falls back to REST).
-const STALE_THRESHOLD_MS: u64 = 5_000;
+/// If no WS update arrives for this long, we temporarily allow REST fallback.
+/// Keep this comfortably above normal burst gaps to avoid unnecessary REST polling.
+const BOOK_STALE_THRESHOLD_MS: u64 = 60_000;
 
 struct BookEntry {
     book: OrderBook,
@@ -32,7 +32,7 @@ struct BookEntry {
 pub struct WsClient {
     books: Arc<RwLock<HashMap<String, BookEntry>>>,
     is_market_connected: Arc<AtomicBool>,
-    is_user_connected: Arc<AtomicBool>,
+    _is_user_connected: Arc<AtomicBool>,
     cmd_tx: mpsc::UnboundedSender<Vec<String>>,
     pub error_rx: mpsc::UnboundedReceiver<String>,
     pub user_events_rx: mpsc::UnboundedReceiver<Value>,
@@ -47,6 +47,8 @@ impl WsClient {
         poly_api_secret: String,
         poly_api_passphrase: String,
     ) -> Result<(Self, Arc<Notify>)> {
+        crate::init_rustls_provider();
+
         let books: Arc<RwLock<HashMap<String, BookEntry>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let notify = Arc::new(Notify::new());
@@ -73,13 +75,13 @@ impl WsClient {
             ws_user_loop(poly_api_key, poly_api_secret, poly_api_passphrase, user_events_tx, err_tx, is_user_connected_clone).await;
         });
 
-        Ok((Self { books, is_market_connected, is_user_connected, cmd_tx, error_rx: err_rx, user_events_rx }, notify))
+        Ok((Self { books, is_market_connected, _is_user_connected: is_user_connected, cmd_tx, error_rx: err_rx, user_events_rx }, notify))
     }
 
     pub async fn get_order_book(&self, token_id: &str) -> Option<OrderBook> {
         let books = self.books.read().await;
         books.get(token_id).and_then(|e| {
-            if e.updated_at.elapsed().as_millis() < STALE_THRESHOLD_MS as u128 {
+            if e.updated_at.elapsed().as_millis() < BOOK_STALE_THRESHOLD_MS as u128 {
                 Some(e.book.clone())
             } else {
                 None
@@ -98,8 +100,14 @@ impl WsClient {
         let _ = self.cmd_tx.send(token_ids);
     }
 
-    pub async fn is_healthy(&self, _token_id: &str) -> bool {
-        self.is_market_connected.load(Ordering::Relaxed) && self.is_user_connected.load(Ordering::Relaxed)
+    pub async fn is_healthy(&self, token_id: &str) -> bool {
+        if !self.is_market_connected.load(Ordering::Relaxed) {
+            return false;
+        }
+        match self.get_book_age_ms(token_id).await {
+            Some(age_ms) => age_ms < BOOK_STALE_THRESHOLD_MS,
+            None => false,
+        }
     }
 }
 
@@ -122,9 +130,16 @@ async fn ws_market_loop(
             cmd_opt = cmd_rx.recv() => {
                 match cmd_opt {
                     Some(tokens_str) => {
-                        let tokens: Vec<U256> = tokens_str.iter()
-                            .filter_map(|t| U256::from_str(t).ok())
-                            .collect();
+                        let mut tokens: Vec<U256> = Vec::new();
+                        for raw in &tokens_str {
+                            match parse_ws_token_id(raw) {
+                                Ok(id) => tokens.push(id),
+                                Err(e) => {
+                                    let _ = err_tx.send(format!("WS token parse error for '{raw}': {e}"));
+                                    warn!("WS token parse error for '{}': {}", raw, e);
+                                }
+                            }
+                        }
                         
                         if !active_tokens.is_empty() {
                             let _ = client.unsubscribe_orderbook(&active_tokens);
@@ -132,7 +147,7 @@ async fn ws_market_loop(
                         }
                         
                         active_tokens = tokens;
-                        
+
                         if !active_tokens.is_empty() {
                             match client.subscribe_orderbook(active_tokens.clone()) {
                                 Ok(stream) => { orderbook_stream = Some(Box::new(Box::pin(stream))); }
@@ -143,6 +158,9 @@ async fn ws_market_loop(
                                 Err(e) => { let _ = err_tx.send(format!("WS SDK sub error: {}", e)); }
                             }
                             info!("WS SDK: seamlessly subscribed to {} tokens", active_tokens.len());
+                        } else {
+                            let _ = err_tx.send("WS subscribe skipped: no valid token IDs".to_string());
+                            warn!("WS subscribe skipped: no valid token IDs");
                         }
                     }
                     None => {
@@ -184,6 +202,17 @@ async fn ws_market_loop(
                 }
             }
         }
+    }
+}
+
+fn parse_ws_token_id(token_id: &str) -> Result<U256> {
+    if token_id.starts_with("0x") || token_id.starts_with("0X") {
+        let clean = token_id.trim_start_matches("0x").trim_start_matches("0X");
+        U256::from_str_radix(clean, 16)
+            .map_err(|e| anyhow::anyhow!("invalid hex token id: {}", e))
+    } else {
+        U256::from_str_radix(token_id, 10)
+            .map_err(|e| anyhow::anyhow!("invalid decimal token id: {}", e))
     }
 }
 

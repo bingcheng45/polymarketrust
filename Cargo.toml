@@ -51,6 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 anyhow = "1"
 thiserror = "1"
+rustls = { version = "0.23", features = ["ring"] }
 
 # Cryptography (for CLOB API auth)
 hmac = "0.12"
