@@ -9,26 +9,19 @@
 
 use crate::config::Config;
 use crate::types::{
-    BalanceAllowance, GammaMarket, MarketInfo, OpenOrder, OrderBook, OrderResponse,
+    GammaEvent, GammaMarket, MarketInfo, OpenOrder, OrderBook, OrderResponse,
     Side, SignedOrder, TimeInForce, TokenIds, TradeRecord,
 };
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use chrono::Utc;
-use ethers::abi::{encode as abi_encode, Token};
-use ethers::core::k256::ecdsa::SigningKey;
-use ethers::prelude::*;
-use ethers::utils::keccak256;
-use hmac::{Hmac, Mac};
-use reqwest::{Client, Response};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use serde_json::{json, Value};
-use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
+const MARKET_EXPIRY_BUFFER_SECS: i64 = 10;
 
 // Polygon contract addresses
 pub const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
@@ -37,211 +30,150 @@ pub const NEG_RISK_ADAPTER: &str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
 pub const CONDITIONAL_TOKENS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 pub const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
-// ─── EIP-712 Signing (manual) ─────────────────────────────────────────────────
+// SDK imports
+use polymarket_client_sdk::auth::Credentials;
+use polymarket_client_sdk::clob::Client as SdkClient;
+use polymarket_client_sdk::clob::Config as SdkConfig;
+use polymarket_client_sdk::types::{Address, U256, B256, Decimal};
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::Normal;
+use polymarket_client_sdk::clob::types::{OrderType as SdkOrderType, Side as SdkSide, AssetType, SignatureType};
+use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrderBookSummaryRequest, OrdersRequest, TradesRequest};
+// CTF client for on-chain operations
+use polymarket_client_sdk::ctf;
+use polymarket_client_sdk::ctf::types::{MergePositionsRequest, RedeemPositionsRequest};
+use polymarket_client_sdk::POLYGON;
 
-const ORDER_TYPE_STR: &str = "Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)";
+// Alloy imports
+use alloy::network::EthereumWallet;
+use alloy::providers::ProviderBuilder;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer as AlloySigner;
+use alloy::sol_types::SolCall;
+use std::str::FromStr;
 
-const DOMAIN_TYPE_STR: &str =
-    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+// ─── Solidity interfaces via alloy sol! macro ─────────────────────────────────
 
-fn domain_separator(verifying_contract: Address) -> [u8; 32] {
-    let domain_type_hash = keccak256(DOMAIN_TYPE_STR.as_bytes());
-    let name_hash = keccak256("Polymarket CTF Exchange".as_bytes());
-    let version_hash = keccak256("1".as_bytes());
-
-    let encoded = abi_encode(&[
-        Token::FixedBytes(domain_type_hash.to_vec()),
-        Token::FixedBytes(name_hash.to_vec()),
-        Token::FixedBytes(version_hash.to_vec()),
-        Token::Uint(U256::from(137u64)), // Polygon chain ID
-        Token::Address(verifying_contract),
-    ]);
-
-    keccak256(encoded)
+// CTF contract — used for ABI encoding calldata in Gnosis Safe path + read-only eth_call.
+// The EOA path uses polymarket_client_sdk::ctf::Client which has its own internal sol! binding.
+alloy::sol! {
+    interface IConditionalTokens {
+        function balanceOf(address account, uint256 id) external view returns (uint256);
+        function isApprovedForAll(address account, address operator) external view returns (bool);
+        function setApprovalForAll(address operator, bool approved) external;
+        function mergePositions(
+            address collateralToken,
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256[] calldata partition,
+            uint256 amount
+        ) external;
+        function redeemPositions(
+            address collateralToken,
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256[] calldata indexSets
+        ) external;
+    }
 }
 
-fn order_hash(
-    salt: U256,
-    maker: Address,
-    signer: Address,
-    token_id: U256,
-    maker_amount: U256,
-    taker_amount: U256,
-    expiration: U256,
-    nonce: U256,
-    fee_rate_bps: U256,
-    side: u8,
-    signature_type: u8,
-) -> [u8; 32] {
-    let type_hash = keccak256(ORDER_TYPE_STR.as_bytes());
-
-    let encoded = abi_encode(&[
-        Token::FixedBytes(type_hash.to_vec()),
-        Token::Uint(salt),
-        Token::Address(maker),
-        Token::Address(signer),
-        Token::Address(Address::zero()), // taker = zero address
-        Token::Uint(token_id),
-        Token::Uint(maker_amount),
-        Token::Uint(taker_amount),
-        Token::Uint(expiration),
-        Token::Uint(nonce),
-        Token::Uint(fee_rate_bps),
-        Token::Uint(U256::from(side as u64)),
-        Token::Uint(U256::from(signature_type as u64)),
-    ]);
-
-    keccak256(encoded)
-}
-
-/// Compute the final EIP-712 hash: \x19\x01 || domainSeparator || structHash
-fn typed_data_hash(domain_sep: [u8; 32], struct_hash: [u8; 32]) -> [u8; 32] {
-    let mut data = Vec::with_capacity(66);
-    data.extend_from_slice(&[0x19u8, 0x01u8]);
-    data.extend_from_slice(&domain_sep);
-    data.extend_from_slice(&struct_hash);
-    keccak256(data)
+// Gnosis Safe — used for the Safe path when SIGNATURE_TYPE=2.
+alloy::sol! {
+    #[sol(rpc)]
+    interface IGnosisSafe {
+        function execTransaction(
+            address to,
+            uint256 value,
+            bytes calldata data,
+            uint8 operation,
+            uint256 safeTxGas,
+            uint256 baseGas,
+            uint256 gasPrice,
+            address gasToken,
+            address refundReceiver,
+            bytes memory signatures
+        ) external payable returns (bool success);
+    }
 }
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 pub struct ClobClient {
-    http: Client,
+    http: reqwest::Client,
     config: Arc<Config>,
-    wallet: LocalWallet,
-    signer_address: Address,
-    /// Maker address: proxy if using proxy, else signer.
+    sdk_client: SdkClient<Authenticated<Normal>>,
+    signer: PrivateKeySigner,
+    signer_addr: Address,
     maker_address: Address,
-    /// Domain separator for normal CTF Exchange.
-    ds_ctf: [u8; 32],
-    /// Domain separator for NegRisk CTF Exchange.
-    ds_neg_risk: [u8; 32],
 }
 
 impl ClobClient {
-    pub fn new(config: Arc<Config>) -> Result<Self> {
-        let private_key_bytes = hex::decode(&config.private_key)?;
-        let signing_key = SigningKey::from_bytes(private_key_bytes.as_slice().into())
-            .context("Invalid private key")?;
-        let wallet = LocalWallet::from(signing_key).with_chain_id(137u64);
-        let signer_address = wallet.address();
-
-        let maker_address = if let Some(proxy) = &config.poly_proxy_address {
-            proxy
-                .parse::<Address>()
-                .context("Invalid POLY_PROXY_ADDRESS")?
-        } else {
-            signer_address
-        };
-
-        let ctf_addr: Address = CTF_EXCHANGE.parse().unwrap();
-        let neg_risk_addr: Address = NEG_RISK_CTF_EXCHANGE.parse().unwrap();
-
-        let http = Client::builder()
+    pub async fn new(config: Arc<Config>) -> Result<Self> {
+        let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
+
+        let raw_key = config.private_key.trim_start_matches("0x");
+
+        let signer = PrivateKeySigner::from_str(raw_key)
+            .context("Invalid private key")?
+            .with_chain_id(Some(POLYGON));
+
+        let signer_addr = signer.address();
+
+        let maker_address = if let Some(proxy) = &config.poly_proxy_address {
+            proxy.parse::<Address>().context("Invalid POLY_PROXY_ADDRESS")?
+        } else {
+            signer_addr
+        };
+
+        let sdk_config = SdkConfig::builder().use_server_time(true).build();
+        let unauth_client = SdkClient::new(CLOB_BASE, sdk_config)?;
+
+        let uuid_key = uuid::Uuid::parse_str(&config.poly_api_key)
+            .context("Invalid API Key UUID")?;
+
+        let credentials = Credentials::new(
+            uuid_key,
+            config.poly_api_secret.clone(),
+            config.poly_api_passphrase.clone(),
+        );
+
+        let sig_type = match config.signature_type {
+            1 => SignatureType::Proxy,
+            2 => SignatureType::GnosisSafe,
+            _ => SignatureType::Eoa,
+        };
+
+        let auth_client = unauth_client
+            .authentication_builder(&signer)
+            .credentials(credentials)
+            .funder(maker_address)
+            .signature_type(sig_type)
+            .authenticate()
+            .await
+            .context("Failed to authenticate SDK Client")?;
 
         Ok(Self {
             http,
             config,
-            wallet,
-            signer_address,
+            sdk_client: auth_client,
+            signer,
+            signer_addr,
             maker_address,
-            ds_ctf: domain_separator(ctf_addr),
-            ds_neg_risk: domain_separator(neg_risk_addr),
         })
     }
 
     pub fn signer_address(&self) -> Address {
-        self.signer_address
+        self.signer_addr
     }
 
     pub fn maker_address(&self) -> Address {
         self.maker_address
     }
 
-    // ─── L2 Auth Helpers ──────────────────────────────────────────────────────
-
-    fn l2_headers(&self, method: &str, path: &str, body: &str) -> Result<Vec<(String, String)>> {
-        let timestamp = Utc::now().timestamp().to_string();
-        let nonce = "0";
-        let msg = format!("{}{}{}{}", timestamp, method.to_uppercase(), path, body);
-
-        let secret_bytes = BASE64
-            .decode(&self.config.poly_api_secret)
-            .context("Invalid POLY_API_SECRET (not base64)")?;
-
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&secret_bytes).context("HMAC key error")?;
-        mac.update(msg.as_bytes());
-        let result = mac.finalize();
-        let signature = BASE64.encode(result.into_bytes());
-
-        Ok(vec![
-            (
-                "POLY_ADDRESS".to_string(),
-                format!("{:?}", self.maker_address),
-            ),
-            ("POLY_SIGNATURE".to_string(), signature),
-            ("POLY_TIMESTAMP".to_string(), timestamp),
-            ("POLY_NONCE".to_string(), nonce.to_string()),
-            (
-                "POLY_API_KEY".to_string(),
-                self.config.poly_api_key.clone(),
-            ),
-            (
-                "POLY_PASSPHRASE".to_string(),
-                self.config.poly_api_passphrase.clone(),
-            ),
-        ])
-    }
-
-    async fn authenticated_get(&self, path: &str) -> Result<Response> {
-        let url = format!("{CLOB_BASE}{path}");
-        let headers = self.l2_headers("GET", path, "")?;
-        let mut req = self.http.get(&url);
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        Ok(req.send().await?)
-    }
-
-    async fn authenticated_post(&self, path: &str, body: &Value) -> Result<Response> {
-        let body_str = serde_json::to_string(body)?;
-        let headers = self.l2_headers("POST", path, &body_str)?;
-        let url = format!("{CLOB_BASE}{path}");
-        let mut req = self.http.post(&url).json(body);
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        Ok(req.send().await?)
-    }
-
-    async fn authenticated_delete(&self, path: &str, body: &Value) -> Result<Response> {
-        let body_str = serde_json::to_string(body)?;
-        let headers = self.l2_headers("DELETE", path, &body_str)?;
-        let url = format!("{CLOB_BASE}{path}");
-        let mut req = self.http.delete(&url).json(body);
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        Ok(req.send().await?)
-    }
-
     // ─── EIP-712 Order Signing ────────────────────────────────────────────────
 
-    /// Compute makerAmount and takerAmount from price/size/side.
-    /// All amounts are in "units of 1e6" (USDC has 6 decimals; CTF shares use 1e6 precision).
-    fn amounts(price: f64, size: f64, side: &Side) -> (U256, U256) {
-        let usdc = (price * size * 1_000_000.0).floor() as u128;
-        let shares = (size * 1_000_000.0).floor() as u128;
-        match side {
-            Side::Buy => (U256::from(usdc), U256::from(shares)),
-            Side::Sell => (U256::from(shares), U256::from(usdc)),
-        }
-    }
-
-    /// Sign an order using EIP-712 typed data.
     pub async fn sign_order(
         &self,
         token_id: &str,
@@ -249,254 +181,207 @@ impl ClobClient {
         size: f64,
         side: Side,
         time_in_force: TimeInForce,
-        neg_risk: bool,
-        fee_rate_bps: u64,
+        _neg_risk: bool,
+        _fee_rate_bps: u64,
     ) -> Result<SignedOrder> {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-
-        // Floor size to 2 decimal places to prevent "insufficient balance" errors
         let size = (size * 100.0).floor() / 100.0;
+        let size_decimal = Decimal::from_str(&size.to_string())?;
+        let price_decimal = Decimal::from_str(&price.to_string())?;
 
-        let salt = U256::from(rng.gen::<u64>());
-
-        let token_id_u256 = parse_token_id(token_id)?;
-
-        let expiration = match time_in_force {
-            TimeInForce::Fok | TimeInForce::Gtc => U256::zero(),
-            TimeInForce::Gtd => U256::from(Utc::now().timestamp() as u64 + 300),
+        let sdk_side = match side {
+            Side::Buy => SdkSide::Buy,
+            Side::Sell => SdkSide::Sell,
+        };
+        let sdk_order_type = match time_in_force {
+            TimeInForce::Fok => SdkOrderType::FOK,
+            TimeInForce::Gtc => SdkOrderType::GTC,
+            TimeInForce::Gtd => SdkOrderType::GTD,
         };
 
-        let side_u8: u8 = match &side {
-            Side::Buy => 0,
-            Side::Sell => 1,
-        };
+        let limit_order = self.sdk_client
+            .limit_order()
+            .token_id(U256::from_str(token_id)?)
+            .price(price_decimal)
+            .size(size_decimal)
+            .side(sdk_side)
+            .order_type(sdk_order_type)
+            .build()
+            .await?;
 
-        let (maker_amount, taker_amount) = Self::amounts(price, size, &side);
-
-        let o_hash = order_hash(
-            salt,
-            self.maker_address,
-            self.signer_address,
-            token_id_u256,
-            maker_amount,
-            taker_amount,
-            expiration,
-            U256::zero(),
-            U256::from(fee_rate_bps),
-            side_u8,
-            self.config.signature_type,
-        );
-
-        let ds = if neg_risk { self.ds_neg_risk } else { self.ds_ctf };
-        let final_hash = typed_data_hash(ds, o_hash);
-
-        // Sign the final hash using the wallet's private key
-        let signature = self
-            .wallet
-            .sign_hash(H256::from(final_hash))
-            .context("Signing failed")?;
-
-        let side_str = match &side {
-            Side::Buy => "BUY",
-            Side::Sell => "SELL",
-        };
-
-        Ok(SignedOrder {
-            salt: salt.to_string(),
-            maker: format!("{:?}", self.maker_address),
-            signer: format!("{:?}", self.signer_address),
-            taker: format!("{:?}", Address::zero()),
-            token_id: token_id.to_string(),
-            maker_amount: maker_amount.to_string(),
-            taker_amount: taker_amount.to_string(),
-            expiration: expiration.to_string(),
-            nonce: "0".to_string(),
-            fee_rate_bps: fee_rate_bps.to_string(),
-            side: side_str.to_string(),
-            signature_type: self.config.signature_type.to_string(),
-            signature: format!("{signature}"),
-        })
+        let signed = self.sdk_client.sign(&self.signer, limit_order).await?;
+        Ok(signed)
     }
 
     // ─── REST API Methods ─────────────────────────────────────────────────────
 
-    /// GET /book?token_id=<id> — Fetch REST orderbook snapshot.
     pub async fn get_order_book(&self, token_id: &str) -> Result<OrderBook> {
-        let path = format!("/book?token_id={token_id}");
-        let resp = self
-            .http
-            .get(&format!("{CLOB_BASE}{path}"))
-            .send()
-            .await?;
+        let req = OrderBookSummaryRequest::builder()
+            .token_id(U256::from_str(token_id)?)
+            .build();
 
-        if resp.status() == 404 {
-            return Ok(OrderBook::default());
+        match self.sdk_client.order_book(&req).await {
+            Ok(resp) => {
+                let mut book = OrderBook {
+                    bids: resp.bids.into_iter().map(|o| crate::types::PriceLevel {
+                        price: o.price.to_string(),
+                        size: o.size.to_string(),
+                    }).collect(),
+                    asks: resp.asks.into_iter().map(|o| crate::types::PriceLevel {
+                        price: o.price.to_string(),
+                        size: o.size.to_string(),
+                    }).collect(),
+                    timestamp: None,
+                };
+                book.sort();
+                Ok(book)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("404") || msg.contains("Not Found") {
+                    Ok(OrderBook::default())
+                } else {
+                    Err(e.into())
+                }
+            }
         }
-
-        let mut book: OrderBook = resp
-            .json()
-            .await
-            .context("Failed to parse orderbook")?;
-        book.sort();
-        Ok(book)
     }
 
-    /// POST /order — Place a single signed order.
     pub async fn post_order(
         &self,
-        order: &SignedOrder,
-        time_in_force: &str,
+        order: SignedOrder,
+        _time_in_force: &str,
     ) -> Result<OrderResponse> {
-        let body = json!({
-            "order": order,
-            "owner": format!("{:?}", self.maker_address),
-            "orderType": time_in_force,
-        });
-
-        let resp = self.authenticated_post("/order", &body).await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-
-        if !status.is_success() {
-            if text.contains("not filled") || text.contains("No matching") {
-                return Ok(OrderResponse {
-                    order_id: String::new(),
-                    status: Some("UNMATCHED".to_string()),
-                    size_matched: Some("0".to_string()),
-                    error_msg: None,
-                });
+        match self.sdk_client.post_order(order).await {
+            Ok(resp) => {
+                let status_str = format!("{:?}", resp.status).to_uppercase();
+                Ok(OrderResponse {
+                    order_id: resp.order_id,
+                    status: Some(status_str),
+                    size_matched: Some(resp.taking_amount.to_string()),
+                    error_msg: resp.error_msg,
+                })
             }
-            anyhow::bail!("post_order HTTP {status}: {text}");
+            Err(e) => {
+                let text = e.to_string();
+                if text.contains("not filled") || text.contains("No matching") {
+                    return Ok(OrderResponse {
+                        order_id: String::new(),
+                        status: Some("UNMATCHED".to_string()),
+                        size_matched: Some("0".to_string()),
+                        error_msg: None,
+                    });
+                }
+                anyhow::bail!("post_order error: {e}");
+            }
         }
-
-        serde_json::from_str(&text).context("Failed to parse order response")
     }
 
-    /// POST /orders — Place multiple orders atomically (batch).
     pub async fn post_orders(
         &self,
-        orders: &[&SignedOrder],
-        time_in_force: &str,
+        orders: Vec<SignedOrder>,
+        _time_in_force: &str,
     ) -> Result<Vec<OrderResponse>> {
-        let order_list: Vec<Value> = orders
-            .iter()
-            .map(|o| {
-                json!({
-                    "order": o,
-                    "owner": format!("{:?}", self.maker_address),
-                    "orderType": time_in_force,
-                })
-            })
-            .collect();
-
-        let resp = self.authenticated_post("/orders", &json!(order_list)).await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!("post_orders HTTP {status}: {text}");
-        }
-
-        serde_json::from_str::<Vec<OrderResponse>>(&text)
-            .context("Failed to parse orders response")
+        let resps = self.sdk_client.post_orders(orders).await?;
+        Ok(resps.into_iter().map(|resp| OrderResponse {
+            order_id: resp.order_id,
+            status: Some(format!("{:?}", resp.status).to_uppercase()),
+            size_matched: Some(resp.taking_amount.to_string()),
+            error_msg: resp.error_msg,
+        }).collect())
     }
 
-    /// DELETE /order — Cancel a single order by ID.
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let body = json!({ "orderID": order_id });
-        let resp = self.authenticated_delete("/order", &body).await?;
-        if !resp.status().is_success() {
-            let text = resp.text().await?;
-            warn!("cancel_order failed: {text}");
-        }
+        let _ = self.sdk_client.cancel_order(order_id).await?;
         Ok(())
     }
 
-    /// DELETE /orders — Cancel all open orders.
     pub async fn cancel_all_orders(&self) -> Result<()> {
-        let body = json!({});
-        let resp = self.authenticated_delete("/orders", &body).await?;
-        if !resp.status().is_success() {
-            let text = resp.text().await?;
-            warn!("cancel_all_orders failed: {text}");
-        }
+        let _ = self.sdk_client.cancel_all_orders().await?;
         Ok(())
     }
 
-    /// GET /orders?market=<condition_id> — Fetch open orders for a market.
     pub async fn get_open_orders(&self, condition_id: &str) -> Result<Vec<OpenOrder>> {
-        let path = format!("/orders?market={condition_id}");
-        let resp = self.authenticated_get(&path).await?;
-        if resp.status() == 404 {
-            return Ok(vec![]);
-        }
-        let text = resp.text().await?;
-        serde_json::from_str(&text).context("Failed to parse open orders")
+        let req = OrdersRequest::builder().market(B256::from_str(condition_id)?).build();
+        let page = self.sdk_client.orders(&req, None).await?;
+
+        Ok(page.data.into_iter().map(|o| OpenOrder {
+            id: o.id,
+            status: Some(format!("{:?}", o.status).to_uppercase()),
+            token_id: o.asset_id.to_string(),
+            side: format!("{:?}", o.side).to_uppercase(),
+            original_size: o.original_size.to_string(),
+            size_matched: o.size_matched.to_string(),
+            remaining_size: (o.original_size - o.size_matched).to_string(),
+            price: o.price.to_string(),
+        }).collect())
     }
 
-    /// GET /order/<id> — Fetch a specific order's current state.
     pub async fn get_order(&self, order_id: &str) -> Result<Option<OpenOrder>> {
-        let path = format!("/order/{order_id}");
-        let resp = self.authenticated_get(&path).await?;
-        if resp.status() == 404 {
-            return Ok(None);
+        match self.sdk_client.order(order_id).await {
+            Ok(o) => {
+                Ok(Some(OpenOrder {
+                    id: o.id,
+                    status: Some(format!("{:?}", o.status).to_uppercase()),
+                    token_id: o.asset_id.to_string(),
+                    side: format!("{:?}", o.side).to_uppercase(),
+                    original_size: o.original_size.to_string(),
+                    size_matched: o.size_matched.to_string(),
+                    remaining_size: (o.original_size - o.size_matched).to_string(),
+                    price: o.price.to_string(),
+                }))
+            }
+            Err(_) => Ok(None)
         }
-        let text = resp.text().await?;
-        Ok(Some(
-            serde_json::from_str(&text).context("Failed to parse order")?,
-        ))
     }
 
-    /// GET /balance-allowance — Fetch USDC balance.
     pub async fn get_balance(&self) -> Result<f64> {
-        let asset_type = if self.config.uses_proxy() { 1 } else { 0 };
-        let path = format!(
-            "/balance-allowance?asset_type={asset_type}&signature_type={}",
-            self.config.signature_type
-        );
-        let resp = self.authenticated_get(&path).await?;
-        let ba: BalanceAllowance = resp.json().await?;
-        Ok(ba.balance_f64())
+        let req = BalanceAllowanceRequest::builder().asset_type(AssetType::Collateral).build();
+        let resp = self.sdk_client.balance_allowance(req).await?;
+        let balance_str = resp.balance.to_string();
+        let f = balance_str.parse::<f64>().unwrap_or(0.0);
+        info!("Balance: raw='{}' → ${:.6}", balance_str, f);
+        Ok(f)
     }
 
-    /// GET /trades — Fetch historical trade records.
     pub async fn get_trades(&self, condition_id: Option<&str>) -> Result<Vec<TradeRecord>> {
-        let mut path = format!(
-            "/trades?maker_address={}",
-            format!("{:?}", self.maker_address)
-        );
-        if let Some(cid) = condition_id {
-            path.push_str(&format!("&condition_id={cid}"));
-        }
-        let resp = self.authenticated_get(&path).await?;
-        if resp.status() == 404 {
-            return Ok(vec![]);
-        }
-        resp.json().await.context("Failed to parse trades")
+        let req = if let Some(cid) = condition_id {
+            TradesRequest::builder()
+                .maker_address(self.maker_address.0.0.into())
+                .market(B256::from_str(cid)?)
+                .build()
+        } else {
+            TradesRequest::builder()
+                .maker_address(self.maker_address.0.0.into())
+                .build()
+        };
+        let page = self.sdk_client.trades(&req, None).await?;
+
+        Ok(page.data.into_iter().map(|t| TradeRecord {
+            id: t.id,
+            condition_id: format!("{:?}", t.market),
+            token_id: t.asset_id.to_string(),
+            side: format!("{:?}", t.side).to_uppercase(),
+            price: t.price.to_string(),
+            size: t.size.to_string(),
+            fee_rate_bps: Some(t.fee_rate_bps.to_string()),
+            created_at: Some(t.match_time.timestamp().to_string()),
+        }).collect())
     }
 
-    /// GET /markets/<condition_id> — Fetch market's fee rate in bps.
-    pub async fn get_market_fee_rate_bps(&self, condition_id: &str) -> Result<u64> {
-        let resp = self
-            .http
-            .get(&format!("{CLOB_BASE}/markets/{condition_id}"))
-            .send()
-            .await?;
-        let v: Value = resp.json().await?;
-        let bps = v
-            .get("feeRateBps")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        Ok(bps)
+    pub async fn get_market_fee_rate_bps(&self, token_id: &str) -> Result<u64> {
+        let resp = self.sdk_client.fee_rate_bps(U256::from_str(token_id)?).await?;
+        Ok(resp.base_fee as u64)
     }
 
     // ─── Gamma API (Market Discovery) ────────────────────────────────────────
-
     /// Find the active market for a slug prefix using the Gamma API.
     /// Returns the soonest-ending active market to maximise theta-decay edge.
     pub async fn find_active_market(&self, slug_prefix: &str) -> Result<Option<MarketInfo>> {
+        let slug_prefix = slug_prefix.trim().to_ascii_lowercase();
+        if slug_prefix.is_empty() {
+            return Ok(None);
+        }
+
         let tag_id: Option<u64> = if slug_prefix.contains("15m") {
             Some(102467)
         } else if slug_prefix.contains("5m") {
@@ -507,8 +392,10 @@ impl ClobClient {
             None
         };
 
+        let now = Utc::now();
+        let end_date_min = now.to_rfc3339_opts(SecondsFormat::Secs, true);
         let mut url = format!(
-            "{GAMMA_BASE}/markets?slug_prefix={slug_prefix}&active=true&closed=false&limit=20"
+            "{GAMMA_BASE}/events?limit=100&active=true&closed=false&order=endDate&ascending=true&end_date_min={end_date_min}"
         );
         if let Some(tid) = tag_id {
             url.push_str(&format!("&tag_id={tid}"));
@@ -519,49 +406,28 @@ impl ClobClient {
             return Ok(None);
         }
 
-        let markets: Vec<GammaMarket> = resp
+        let events: Vec<GammaEvent> = resp
             .json()
             .await
-            .context("Failed to parse Gamma markets")?;
+            .context("Failed to parse Gamma events")?;
 
-        if markets.is_empty() {
+        if events.is_empty() {
             return Ok(None);
         }
 
-        let mut sorted = markets;
-        sorted.sort_by(|a, b| {
-            a.end_date
-                .as_deref()
-                .unwrap_or("9999")
-                .cmp(b.end_date.as_deref().unwrap_or("9999"))
-        });
+        let min_end_date = now + ChronoDuration::seconds(MARKET_EXPIRY_BUFFER_SECS);
+        let sorted = select_market_candidates(events, &slug_prefix, min_end_date);
 
-        for m in sorted {
-            let tokens = match &m.tokens {
-                Some(t) if t.len() >= 2 => t.clone(),
-                _ => continue,
+        for (m, end_date) in sorted {
+            let clob_token_ids_str = match &m.clob_token_ids {
+                Some(s) => s,
+                None => continue,
             };
 
-            let yes_token = tokens
-                .iter()
-                .find(|t| t.outcome.to_uppercase() == "YES")
-                .cloned();
-            let no_token = tokens
-                .iter()
-                .find(|t| t.outcome.to_uppercase() == "NO")
-                .cloned();
-
-            let (yes, no) = match (yes_token, no_token) {
-                (Some(y), Some(n)) => (y, n),
+            let (yes, no) = match extract_binary_token_pair(clob_token_ids_str, m.outcomes.as_deref()) {
+                Some((y, n)) => (y, n),
                 _ => continue,
             };
-
-            let end_date = m
-                .end_date
-                .as_deref()
-                .unwrap_or("2099-01-01T00:00:00Z")
-                .parse::<chrono::DateTime<chrono::Utc>>()
-                .unwrap_or_else(|_| chrono::Utc::now() + chrono::Duration::days(365));
 
             return Ok(Some(MarketInfo {
                 condition_id: m.condition_id,
@@ -570,8 +436,8 @@ impl ClobClient {
                 neg_risk: m.neg_risk,
                 tick_size: m.tick_size.unwrap_or(0.01),
                 tokens: TokenIds {
-                    yes: yes.token_id,
-                    no: no.token_id,
+                    yes,
+                    no,
                 },
             }));
         }
@@ -653,49 +519,23 @@ impl ClobClient {
 
     // ─── On-chain Contract Calls ──────────────────────────────────────────────
 
-    /// Burns YES + NO shares → USDC by calling `mergePositions` on the CTF Exchange.
+    /// Burns YES + NO shares → USDC by calling `mergePositions` on the Conditional Token contract.
     ///
     /// Supports both EOA (SIGNATURE_TYPE=0) and Gnosis Safe (SIGNATURE_TYPE=2).
     /// `amount` is in shares; internally converted to 1e6 units (USDC precision).
+    ///
+    /// EOA path: delegates to polymarket_client_sdk::ctf::Client (handles all contract routing).
+    /// Safe path: builds calldata via sol! ABI encoding and calls execTransaction on the Safe.
     pub async fn merge_positions(
         &self,
         condition_id: &str,
         amount: f64,
         neg_risk: bool,
         rpc_url: &str,
-    ) -> Result<H256> {
+    ) -> Result<B256> {
+        let usdc: Address = USDC_ADDRESS.parse()?;
+        let cid: B256 = B256::from_str(condition_id)?;
         let amount_u256 = U256::from((amount * 1_000_000.0).floor() as u128);
-
-        let condition_bytes: [u8; 32] = {
-            let clean = condition_id.trim_start_matches("0x");
-            let mut arr = [0u8; 32];
-            let decoded = hex::decode(clean).context("Invalid condition_id")?;
-            arr[..decoded.len()].copy_from_slice(&decoded);
-            arr
-        };
-
-        let contract_addr: Address = if neg_risk {
-            NEG_RISK_CTF_EXCHANGE.parse().unwrap()
-        } else {
-            CTF_EXCHANGE.parse().unwrap()
-        };
-
-        // mergePositions(address,bytes32,bytes32,uint256[],uint256)
-        let inner_calldata = encode_calldata(
-            "mergePositions(address,bytes32,bytes32,uint256[],uint256)",
-            &[
-                Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
-                Token::FixedBytes([0u8; 32].to_vec()),  // parentCollectionId = zero
-                Token::FixedBytes(condition_bytes.to_vec()),
-                Token::Array(
-                    vec![U256::one(), U256::from(2u64)]
-                        .into_iter()
-                        .map(Token::Uint)
-                        .collect(),
-                ),
-                Token::Uint(amount_u256),
-            ],
-        );
 
         if self.config.uses_proxy() {
             // ── Gnosis Safe path ──────────────────────────────────────────────
@@ -706,58 +546,57 @@ impl ClobClient {
                 .unwrap()
                 .parse()
                 .context("Invalid POLY_PROXY_ADDRESS")?;
-            self.safe_exec_transaction(safe_addr, contract_addr, inner_calldata, 500_000, rpc_url)
+
+            // mergePositions is on CONDITIONAL_TOKENS for standard markets,
+            // or NEG_RISK_ADAPTER for neg-risk markets.
+            let contract_addr: Address = if neg_risk {
+                NEG_RISK_ADAPTER.parse()?
+            } else {
+                CONDITIONAL_TOKENS.parse()?
+            };
+
+            let inner = IConditionalTokens::mergePositionsCall {
+                collateralToken: usdc,
+                parentCollectionId: B256::ZERO,
+                conditionId: cid,
+                partition: vec![U256::from(1u64), U256::from(2u64)],
+                amount: amount_u256,
+            }.abi_encode();
+
+            self.safe_exec_transaction(safe_addr, contract_addr, inner, 500_000, rpc_url)
                 .await
         } else {
-            // ── EOA path ─────────────────────────────────────────────────────
-            use ethers::middleware::SignerMiddleware;
-            use ethers::providers::{Http, Provider};
-            let provider = Provider::<Http>::try_from(rpc_url)?;
-            let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
-            let tx = ethers::types::TransactionRequest::new()
-                .to(contract_addr)
-                .data(inner_calldata)
-                .from(self.signer_address);
-            let pending = client.send_transaction(tx, None).await?;
-            let receipt = pending
-                .await?
-                .context("mergePositions: transaction dropped")?;
-            Ok(receipt.transaction_hash)
+            // ── EOA path — SDK ctf::Client handles all contract routing ───────
+            let provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(self.signer.clone()))
+                .connect_http(rpc_url.parse().context("Invalid RPC URL")?);
+
+            let ctf_client = if neg_risk {
+                ctf::Client::with_neg_risk(provider, POLYGON)?
+            } else {
+                ctf::Client::new(provider, POLYGON)?
+            };
+
+            let req = MergePositionsRequest::for_binary_market(usdc, cid, amount_u256);
+            let resp = ctf_client.merge_positions(&req).await?;
+            Ok(resp.transaction_hash)
         }
     }
 
     /// Claims USDC from a resolved market by calling `redeemPositions` on the CTF contract.
     ///
-    /// `index_sets` is typically `[1, 2]` for a standard 2-outcome market.
+    /// Uses the standard binary partition [1, 2] for 2-outcome markets.
     /// Supports both EOA and Gnosis Safe paths.
     pub async fn redeem_positions(
         &self,
         condition_id: &str,
-        index_sets: &[U256],
         rpc_url: &str,
-    ) -> Result<H256> {
-        let condition_bytes: [u8; 32] = {
-            let clean = condition_id.trim_start_matches("0x");
-            let mut arr = [0u8; 32];
-            let decoded = hex::decode(clean).context("Invalid condition_id")?;
-            arr[..decoded.len()].copy_from_slice(&decoded);
-            arr
-        };
-
-        let ctf_addr: Address = CONDITIONAL_TOKENS.parse().unwrap();
-
-        // redeemPositions(address,bytes32,bytes32,uint256[])
-        let inner_calldata = encode_calldata(
-            "redeemPositions(address,bytes32,bytes32,uint256[])",
-            &[
-                Token::Address(USDC_ADDRESS.parse::<Address>().unwrap()),
-                Token::FixedBytes([0u8; 32].to_vec()),
-                Token::FixedBytes(condition_bytes.to_vec()),
-                Token::Array(index_sets.iter().cloned().map(Token::Uint).collect()),
-            ],
-        );
+    ) -> Result<B256> {
+        let usdc: Address = USDC_ADDRESS.parse()?;
+        let cid: B256 = B256::from_str(condition_id)?;
 
         if self.config.uses_proxy() {
+            // ── Gnosis Safe path ──────────────────────────────────────────────
             let safe_addr: Address = self
                 .config
                 .poly_proxy_address
@@ -765,22 +604,28 @@ impl ClobClient {
                 .unwrap()
                 .parse()
                 .context("Invalid POLY_PROXY_ADDRESS")?;
-            self.safe_exec_transaction(safe_addr, ctf_addr, inner_calldata, 500_000, rpc_url)
+
+            let ctf_addr: Address = CONDITIONAL_TOKENS.parse()?;
+
+            let inner = IConditionalTokens::redeemPositionsCall {
+                collateralToken: usdc,
+                parentCollectionId: B256::ZERO,
+                conditionId: cid,
+                indexSets: vec![U256::from(1u64), U256::from(2u64)],
+            }.abi_encode();
+
+            self.safe_exec_transaction(safe_addr, ctf_addr, inner, 500_000, rpc_url)
                 .await
         } else {
-            use ethers::middleware::SignerMiddleware;
-            use ethers::providers::{Http, Provider};
-            let provider = Provider::<Http>::try_from(rpc_url)?;
-            let client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
-            let tx = ethers::types::TransactionRequest::new()
-                .to(ctf_addr)
-                .data(inner_calldata)
-                .from(self.signer_address);
-            let pending = client.send_transaction(tx, None).await?;
-            let receipt = pending
-                .await?
-                .context("redeemPositions: transaction dropped")?;
-            Ok(receipt.transaction_hash)
+            // ── EOA path ─────────────────────────────────────────────────────
+            let provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(self.signer.clone()))
+                .connect_http(rpc_url.parse().context("Invalid RPC URL")?);
+
+            let ctf_client = ctf::Client::new(provider, POLYGON)?;
+            let req = RedeemPositionsRequest::for_binary_market(usdc, cid);
+            let resp = ctf_client.redeem_positions(&req).await?;
+            Ok(resp.transaction_hash)
         }
     }
 
@@ -792,10 +637,11 @@ impl ClobClient {
         rpc_url: &str,
     ) -> Result<f64> {
         let token_id_u256 = parse_token_id(token_id)?;
-        let calldata = encode_calldata(
-            "balanceOf(address,uint256)",
-            &[Token::Address(holder), Token::Uint(token_id_u256)],
-        );
+
+        let calldata = IConditionalTokens::balanceOfCall {
+            account: holder,
+            id: token_id_u256,
+        }.abi_encode();
 
         let call_hex = format!("0x{}", hex::encode(&calldata));
         let body = json!({
@@ -835,7 +681,7 @@ impl ClobClient {
             .parse()
             .context("Invalid POLY_PROXY_ADDRESS")?;
 
-        let ctf_addr: Address = CONDITIONAL_TOKENS.parse().unwrap();
+        let ctf_addr: Address = CONDITIONAL_TOKENS.parse()?;
 
         let operators: &[(&str, &str)] = &[
             ("CTF Exchange", CTF_EXCHANGE),
@@ -844,7 +690,7 @@ impl ClobClient {
         ];
 
         for (name, operator_str) in operators {
-            let operator: Address = operator_str.parse().unwrap();
+            let operator: Address = operator_str.parse()?;
 
             let already_approved = self
                 .check_ctf_approval(safe_addr, operator, rpc_url)
@@ -858,11 +704,10 @@ impl ClobClient {
 
             info!("Granting CTF setApprovalForAll to {name} via Safe...");
 
-            // setApprovalForAll(address operator, bool approved)
-            let calldata = encode_calldata(
-                "setApprovalForAll(address,bool)",
-                &[Token::Address(operator), Token::Bool(true)],
-            );
+            let calldata = IConditionalTokens::setApprovalForAllCall {
+                operator,
+                approved: true,
+            }.abi_encode();
 
             self.safe_exec_transaction(safe_addr, ctf_addr, calldata, 200_000, rpc_url)
                 .await?;
@@ -873,17 +718,17 @@ impl ClobClient {
         Ok(())
     }
 
-    /// Query `isApprovedForAll(account, operator)` on the CTF contract.
+    /// Query `isApprovedForAll(account, operator)` on the CTF contract via eth_call.
     async fn check_ctf_approval(
         &self,
         account: Address,
         operator: Address,
         rpc_url: &str,
     ) -> Result<bool> {
-        let calldata = encode_calldata(
-            "isApprovedForAll(address,address)",
-            &[Token::Address(account), Token::Address(operator)],
-        );
+        let calldata = IConditionalTokens::isApprovedForAllCall {
+            account,
+            operator,
+        }.abi_encode();
 
         let call_hex = format!("0x{}", hex::encode(&calldata));
         let body = json!({
@@ -920,69 +765,49 @@ impl ClobClient {
         inner_calldata: Vec<u8>,
         gas_limit: u64,
         rpc_url: &str,
-    ) -> Result<H256> {
-        use ethers::middleware::SignerMiddleware;
-        use ethers::providers::{Http, Provider};
-
-        let provider = Provider::<Http>::try_from(rpc_url)?;
-        let signer_client = Arc::new(SignerMiddleware::new(provider, self.wallet.clone()));
-
+    ) -> Result<B256> {
         // Fetch live gas price and add 20% buffer
         let gas_price_gwei = self.get_gas_price_gwei().await;
-        let gas_price_wei = U256::from(((gas_price_gwei * 1.2) * 1e9) as u64);
+        let gas_price_wei: u128 = ((gas_price_gwei * 1.2) * 1e9) as u128;
 
         // Pre-validated signature: uint256(signerAddr) ‖ uint256(0) ‖ uint8(1)
-        let sigs = pre_validated_signature(self.signer_address);
+        let sigs = pre_validated_signature(self.signer_addr);
 
-        // execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)
-        let exec_selector = &keccak256(
-            b"execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
-        )[..4];
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(self.signer.clone()))
+            .connect_http(rpc_url.parse().context("Invalid RPC URL")?);
 
-        let encoded_params = abi_encode(&[
-            Token::Address(target),
-            Token::Uint(U256::zero()),       // value
-            Token::Bytes(inner_calldata),    // data
-            Token::Uint(U256::zero()),       // operation = 0 (CALL)
-            Token::Uint(U256::zero()),       // safeTxGas  (0 = use all forwarded gas)
-            Token::Uint(U256::zero()),       // baseGas
-            Token::Uint(U256::zero()),       // gasPrice in Safe (0 = no refund)
-            Token::Address(Address::zero()), // gasToken
-            Token::Address(Address::zero()), // refundReceiver
-            Token::Bytes(sigs),             // signatures
-        ]);
-
-        let mut exec_calldata = Vec::with_capacity(4 + encoded_params.len());
-        exec_calldata.extend_from_slice(exec_selector);
-        exec_calldata.extend_from_slice(&encoded_params);
-
-        let tx = ethers::types::TransactionRequest::new()
-            .to(safe_addr)
-            .data(exec_calldata)
-            .from(self.signer_address)
+        let pending_tx = IGnosisSafe::new(safe_addr, provider)
+            .execTransaction(
+                target,
+                U256::ZERO,               // value = 0 ETH
+                inner_calldata.into(),    // inner calldata
+                0u8,                      // operation = CALL
+                U256::ZERO,               // safeTxGas (0 = use all gas forwarded)
+                U256::ZERO,               // baseGas
+                U256::ZERO,               // gasPrice (no Safe refund)
+                Address::ZERO,            // gasToken
+                Address::ZERO,            // refundReceiver
+                sigs.into(),              // pre-validated signatures
+            )
             .gas(gas_limit)
-            .gas_price(gas_price_wei);
+            .gas_price(gas_price_wei)
+            .send()
+            .await
+            .context("Gnosis Safe execTransaction: failed to send")?;
 
-        let pending = signer_client.send_transaction(tx, None).await?;
-        let receipt = pending
-            .await?
+        let tx_hash = *pending_tx.tx_hash();
+
+        pending_tx
+            .get_receipt()
+            .await
             .context("Gnosis Safe execTransaction: tx dropped from mempool")?;
 
-        Ok(receipt.transaction_hash)
+        Ok(tx_hash)
     }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Build raw calldata: 4-byte function selector + ABI-encoded parameters.
-fn encode_calldata(sig: &str, tokens: &[Token]) -> Vec<u8> {
-    let selector = &keccak256(sig.as_bytes())[..4];
-    let encoded = abi_encode(tokens);
-    let mut data = Vec::with_capacity(4 + encoded.len());
-    data.extend_from_slice(selector);
-    data.extend_from_slice(&encoded);
-    data
-}
 
 /// Build a Gnosis Safe "pre-validated signature".
 ///
@@ -995,7 +820,7 @@ fn encode_calldata(sig: &str, tokens: &[Token]) -> Vec<u8> {
 /// the transaction without requiring a live ECDSA signature.
 fn pre_validated_signature(signer: Address) -> Vec<u8> {
     let mut sig = vec![0u8; 65];
-    sig[12..32].copy_from_slice(signer.as_bytes()); // right-align address in first 32 bytes
+    sig[12..32].copy_from_slice(signer.as_slice()); // right-align address in first 32 bytes
     // bytes 32-63 already zero (s = 0)
     sig[64] = 1u8; // v = 1 (pre-validated)
     sig
@@ -1003,9 +828,245 @@ fn pre_validated_signature(signer: Address) -> Vec<u8> {
 
 /// Parse a token ID that might be decimal or hex.
 fn parse_token_id(token_id: &str) -> Result<U256> {
-    if let Ok(v) = U256::from_dec_str(token_id) {
-        return Ok(v);
+    if token_id.starts_with("0x") || token_id.starts_with("0X") {
+        let clean = &token_id[2..];
+        U256::from_str_radix(clean, 16)
+            .map_err(|e| anyhow::anyhow!("Invalid hex token_id '{}': {}", token_id, e))
+    } else {
+        U256::from_str_radix(token_id, 10)
+            .map_err(|e| anyhow::anyhow!("Invalid decimal token_id '{}': {}", token_id, e))
     }
-    let clean = token_id.trim_start_matches("0x");
-    U256::from_str_radix(clean, 16).context("Invalid token_id (not decimal or hex)")
+}
+
+fn select_market_candidates(
+    events: Vec<GammaEvent>,
+    slug_prefix: &str,
+    min_end_date: DateTime<Utc>,
+) -> Vec<(GammaMarket, DateTime<Utc>)> {
+    let mut candidates = Vec::new();
+    for event in events {
+        let event_slug_matches = event
+            .slug
+            .as_deref()
+            .map(|slug| slug.to_ascii_lowercase().starts_with(slug_prefix))
+            .unwrap_or(false);
+
+        let markets = match event.markets {
+            Some(markets) => markets,
+            None => continue,
+        };
+
+        for market in markets {
+            let market_slug_matches = market
+                .slug
+                .as_deref()
+                .map(|slug| slug.to_ascii_lowercase().starts_with(slug_prefix))
+                .unwrap_or(false);
+
+            if !event_slug_matches && !market_slug_matches {
+                continue;
+            }
+
+            let end_date = match parse_market_end_date(market.end_date.as_deref()) {
+                Some(dt) => dt,
+                None => continue,
+            };
+
+            if end_date <= min_end_date {
+                continue;
+            }
+
+            candidates.push((market, end_date));
+        }
+    }
+
+    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    candidates
+}
+
+fn parse_market_end_date(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    raw.and_then(|s| s.parse::<DateTime<Utc>>().ok())
+}
+
+fn extract_binary_token_pair(
+    clob_token_ids_raw: &str,
+    outcomes_raw: Option<&str>,
+) -> Option<(String, String)> {
+    let clob_token_ids: Vec<String> = serde_json::from_str(clob_token_ids_raw).ok()?;
+    if clob_token_ids.len() < 2 {
+        return None;
+    }
+
+    if let Some(outcomes_raw) = outcomes_raw {
+        if let Ok(outcomes) = serde_json::from_str::<Vec<String>>(outcomes_raw) {
+            let mut yes_token = None;
+            let mut no_token = None;
+
+            for (tid, out) in clob_token_ids.iter().zip(outcomes.iter()) {
+                let label = out.trim().to_ascii_uppercase();
+                if label == "YES" || label == "UP" {
+                    yes_token = Some(tid.clone());
+                } else if label == "NO" || label == "DOWN" {
+                    no_token = Some(tid.clone());
+                }
+            }
+
+            if let (Some(yes), Some(no)) = (yes_token, no_token) {
+                return Some((yes, no));
+            }
+        }
+    }
+
+    Some((clob_token_ids[0].clone(), clob_token_ids[1].clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn gamma_market(
+        slug: &str,
+        end_date: &str,
+        outcomes: &str,
+        clob_token_ids: &str,
+    ) -> GammaMarket {
+        GammaMarket {
+            condition_id: format!("cid-{slug}"),
+            question: format!("Question for {slug}"),
+            slug: Some(slug.to_string()),
+            end_date: Some(end_date.to_string()),
+            neg_risk: false,
+            clob_token_ids: Some(clob_token_ids.to_string()),
+            outcomes: Some(outcomes.to_string()),
+            enable_order_book: Some(true),
+            tick_size: Some(0.01),
+            closed: Some(false),
+        }
+    }
+
+    fn gamma_event(slug: &str, markets: Vec<GammaMarket>) -> GammaEvent {
+        GammaEvent {
+            slug: Some(slug.to_string()),
+            end_date: markets.first().and_then(|m| m.end_date.clone()),
+            markets: Some(markets),
+        }
+    }
+
+    #[test]
+    fn extract_binary_pair_yes_no() {
+        let pair = extract_binary_token_pair(r#"["yes_id","no_id"]"#, Some(r#"["Yes","No"]"#))
+            .expect("expected token pair");
+        assert_eq!(pair.0, "yes_id");
+        assert_eq!(pair.1, "no_id");
+    }
+
+    #[test]
+    fn extract_binary_pair_up_down_and_lowercase() {
+        let pair = extract_binary_token_pair(r#"["up_id","down_id"]"#, Some(r#"["up","down"]"#))
+            .expect("expected token pair");
+        assert_eq!(pair.0, "up_id");
+        assert_eq!(pair.1, "down_id");
+    }
+
+    #[test]
+    fn extract_binary_pair_unknown_labels_falls_back_to_first_two() {
+        let pair = extract_binary_token_pair(
+            r#"["token_a","token_b","token_c"]"#,
+            Some(r#"["Bull","Bear","Sideways"]"#),
+        )
+        .expect("expected token pair");
+        assert_eq!(pair.0, "token_a");
+        assert_eq!(pair.1, "token_b");
+    }
+
+    #[test]
+    fn select_market_candidates_prefers_nearest_future_match() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 2, 26, 18, 30, 0)
+            .single()
+            .expect("valid datetime");
+
+        let events = vec![
+            gamma_event(
+                "btc-updown-5m-foo",
+                vec![
+                    gamma_market(
+                        "btc-updown-5m-early",
+                        "2026-02-26T18:20:00Z",
+                        r#"["Up","Down"]"#,
+                        r#"["a","b"]"#,
+                    ),
+                    gamma_market(
+                        "btc-updown-5m-target",
+                        "2026-02-26T18:35:00Z",
+                        r#"["Up","Down"]"#,
+                        r#"["c","d"]"#,
+                    ),
+                    gamma_market(
+                        "btc-updown-5m-later",
+                        "2026-02-26T18:40:00Z",
+                        r#"["Up","Down"]"#,
+                        r#"["e","f"]"#,
+                    ),
+                ],
+            ),
+            gamma_event(
+                "eth-updown-5m-foo",
+                vec![gamma_market(
+                    "eth-updown-5m-other",
+                    "2026-02-26T18:31:00Z",
+                    r#"["Up","Down"]"#,
+                    r#"["g","h"]"#,
+                )],
+            ),
+        ];
+
+        let selected = select_market_candidates(events, "btc-updown-5m", now);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0.slug.as_deref(), Some("btc-updown-5m-target"));
+        assert_eq!(selected[1].0.slug.as_deref(), Some("btc-updown-5m-later"));
+    }
+
+    #[test]
+    fn select_market_candidates_filters_non_matching_prefixes() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 2, 26, 18, 30, 0)
+            .single()
+            .expect("valid datetime");
+
+        let events = vec![
+            gamma_event(
+                "eth-updown-5m-foo",
+                vec![gamma_market(
+                    "eth-updown-5m-1",
+                    "2026-02-26T18:45:00Z",
+                    r#"["Up","Down"]"#,
+                    r#"["eth_up","eth_down"]"#,
+                )],
+            ),
+            gamma_event(
+                "xrp-updown-5m-foo",
+                vec![gamma_market(
+                    "xrp-updown-5m-1",
+                    "2026-02-26T18:45:00Z",
+                    r#"["Up","Down"]"#,
+                    r#"["xrp_up","xrp_down"]"#,
+                )],
+            ),
+            gamma_event(
+                "btc-updown-5m-foo",
+                vec![gamma_market(
+                    "btc-updown-5m-1",
+                    "2026-02-26T18:45:00Z",
+                    r#"["Up","Down"]"#,
+                    r#"["btc_up","btc_down"]"#,
+                )],
+            ),
+        ];
+
+        let selected = select_market_candidates(events, "btc-updown-5m", now);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0.slug.as_deref(), Some("btc-updown-5m-1"));
+    }
 }
