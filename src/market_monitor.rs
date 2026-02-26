@@ -39,6 +39,8 @@ const MERGE_RETRY_SECS: u64 = 30;
 const MAX_HEDGE_COOLDOWN_SECS: u64 = 120;
 // Retry interval when no active market is available yet.
 const MARKET_DISCOVERY_RETRY_SECS: u64 = 5;
+// Claimability polling fallback interval.
+const CLAIM_POLL_INTERVAL_SECS: u64 = 5;
 
 pub struct MarketMonitor {
     config: Arc<Config>,
@@ -76,6 +78,7 @@ pub struct MarketMonitor {
 
     // Last merge attempt
     last_merge_attempt: Option<Instant>,
+    last_claim_poll: Option<Instant>,
     last_market_discovery_attempt: Option<Instant>,
 
     // Last time we checked for opportunity
@@ -129,6 +132,7 @@ impl MarketMonitor {
             gas_cache: GasCache::default(),
             _gas_cache_refreshed: None,
             last_merge_attempt: None,
+            last_claim_poll: None,
             last_market_discovery_attempt: None,
             last_check: None,
             errors: Vec::new(),
@@ -389,6 +393,7 @@ impl MarketMonitor {
 
         // Process any incoming User WS events
         self.process_user_events().await;
+        self.maybe_redeem_resolved_positions(false).await;
 
         // Circuit breaker check
         if let Some(until) = self.circuit_breaker_until {
@@ -1405,6 +1410,18 @@ impl MarketMonitor {
         }
     }
 
+    async fn maybe_redeem_resolved_positions(&mut self, force: bool) {
+        if !force {
+            if let Some(last_poll) = self.last_claim_poll {
+                if last_poll.elapsed().as_secs() < CLAIM_POLL_INTERVAL_SECS {
+                    return;
+                }
+            }
+        }
+        self.last_claim_poll = Some(Instant::now());
+        self.redeem_resolved_positions().await;
+    }
+
     // ─── Market Rollover ───────────────────────────────────────────────────────
 
     async fn handle_market_rollover(&mut self) {
@@ -1527,6 +1544,7 @@ impl MarketMonitor {
 
     async fn process_user_events(&mut self) {
         let mut ws_client_opt = self.ws_client.take();
+        let mut force_claim_scan = false;
         if let Some(ref mut ws) = ws_client_opt {
             while let Ok(msg) = ws.user_events_rx.try_recv() {
                 // Peek the event_type
@@ -1544,6 +1562,7 @@ impl MarketMonitor {
                         "trade" => {
                             if let Ok(ev) = serde_json::from_value::<crate::types::WsTradeEvent>(msg) {
                                 info!("WS Trade Event: Executed {} {} shares of {} at {}", ev.side, ev.size, ev.asset_id, ev.price);
+                                self.active_assets.insert(ev.asset_id);
                                 // This provides ultra-low latency confirmation that our order actually matched.
                                 // We rely on this stream going forward to maintain zero-query position state.
                             }
@@ -1559,8 +1578,44 @@ impl MarketMonitor {
                     }
                 }
             }
+
+            while let Ok(msg) = ws.market_events_rx.try_recv() {
+                if let Some(event_type) = msg.get("event_type").and_then(|v| v.as_str()) {
+                    match event_type {
+                        "market_resolved" => {
+                            if let Ok(ev) =
+                                serde_json::from_value::<crate::types::WsMarketResolvedEvent>(msg)
+                            {
+                                if !ev.winning_asset_id.is_empty() {
+                                    self.active_assets.insert(ev.winning_asset_id.clone());
+                                }
+                                for token_id in &ev.asset_ids {
+                                    self.active_assets.insert(token_id.clone());
+                                }
+                                self.last_balance_refresh =
+                                    Instant::now() - Duration::from_secs(30);
+                                force_claim_scan = true;
+                                let q = ev
+                                    .question
+                                    .clone()
+                                    .unwrap_or_else(|| "resolved market".to_string());
+                                self.log_action(&format!(
+                                    "🏁 WS market resolved: {} ({} won) — checking claimability",
+                                    q, ev.winning_outcome
+                                ))
+                                .await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         self.ws_client = ws_client_opt;
+
+        if force_claim_scan {
+            self.maybe_redeem_resolved_positions(true).await;
+        }
     }
 
     // ─── WS Health Check ──────────────────────────────────────────────────────
@@ -1752,6 +1807,7 @@ mod tests {
             gas_cache: GasCache::default(),
             _gas_cache_refreshed: None,
             last_merge_attempt: None,
+            last_claim_poll: None,
             last_market_discovery_attempt: None,
             last_check: None,
             errors: Vec::new(),

@@ -9,7 +9,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use polymarket_client_sdk::auth::Credentials;
 use polymarket_client_sdk::clob::ws::Client;
-use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, PriceChange, WsMessage};
+use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, MarketResolved, PriceChange, WsMessage};
 use polymarket_client_sdk::error::Error as SdkError;
 use polymarket_client_sdk::types::{Address, U256};
 use serde_json::{json, Value};
@@ -36,6 +36,7 @@ pub struct WsClient {
     cmd_tx: mpsc::UnboundedSender<Vec<String>>,
     pub error_rx: mpsc::UnboundedReceiver<String>,
     pub user_events_rx: mpsc::UnboundedReceiver<Value>,
+    pub market_events_rx: mpsc::UnboundedReceiver<Value>,
 }
 
 impl WsClient {
@@ -58,6 +59,7 @@ impl WsClient {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (err_tx, err_rx) = mpsc::unbounded_channel();
         let (user_events_tx, user_events_rx) = mpsc::unbounded_channel();
+        let (market_events_tx, market_events_rx) = mpsc::unbounded_channel();
 
         let books_clone = Arc::clone(&books);
         let notify_clone = notify.clone();
@@ -67,7 +69,15 @@ impl WsClient {
 
         let err_tx_market = err_tx.clone();
         tokio::spawn(async move {
-            ws_market_loop(books_clone, notify_clone, cmd_rx, err_tx_market, is_market_connected_clone).await;
+            ws_market_loop(
+                books_clone,
+                notify_clone,
+                cmd_rx,
+                err_tx_market,
+                market_events_tx,
+                is_market_connected_clone,
+            )
+            .await;
         });
 
         let is_user_connected_clone = Arc::clone(&is_user_connected);
@@ -75,7 +85,18 @@ impl WsClient {
             ws_user_loop(poly_api_key, poly_api_secret, poly_api_passphrase, user_events_tx, err_tx, is_user_connected_clone).await;
         });
 
-        Ok((Self { books, is_market_connected, _is_user_connected: is_user_connected, cmd_tx, error_rx: err_rx, user_events_rx }, notify))
+        Ok((
+            Self {
+                books,
+                is_market_connected,
+                _is_user_connected: is_user_connected,
+                cmd_tx,
+                error_rx: err_rx,
+                user_events_rx,
+                market_events_rx,
+            },
+            notify,
+        ))
     }
 
     pub async fn get_order_book(&self, token_id: &str) -> Option<OrderBook> {
@@ -116,6 +137,7 @@ async fn ws_market_loop(
     notify: Arc<Notify>,
     mut cmd_rx: mpsc::UnboundedReceiver<Vec<String>>,
     err_tx: mpsc::UnboundedSender<String>,
+    market_events_tx: mpsc::UnboundedSender<Value>,
     is_connected: Arc<AtomicBool>,
 ) {
     let client = Client::default();
@@ -124,6 +146,7 @@ async fn ws_market_loop(
     let mut active_tokens: Vec<U256> = Vec::new();
     let mut orderbook_stream: Option<Box<dyn futures_util::Stream<Item = std::result::Result<BookUpdate, SdkError>> + Unpin + Send>> = None;
     let mut prices_stream: Option<Box<dyn futures_util::Stream<Item = std::result::Result<PriceChange, SdkError>> + Unpin + Send>> = None;
+    let mut resolved_stream: Option<Box<dyn futures_util::Stream<Item = std::result::Result<MarketResolved, SdkError>> + Unpin + Send>> = None;
 
     loop {
         tokio::select! {
@@ -144,6 +167,8 @@ async fn ws_market_loop(
                         if !active_tokens.is_empty() {
                             let _ = client.unsubscribe_orderbook(&active_tokens);
                             let _ = client.unsubscribe_prices(&active_tokens);
+                            // `subscribe_market_resolutions` shares the same market ref-count pool.
+                            let _ = client.unsubscribe_orderbook(&active_tokens);
                         }
                         
                         active_tokens = tokens;
@@ -155,6 +180,10 @@ async fn ws_market_loop(
                             }
                             match client.subscribe_prices(active_tokens.clone()) {
                                 Ok(stream) => { prices_stream = Some(Box::new(Box::pin(stream))); }
+                                Err(e) => { let _ = err_tx.send(format!("WS SDK sub error: {}", e)); }
+                            }
+                            match client.subscribe_market_resolutions(active_tokens.clone()) {
+                                Ok(stream) => { resolved_stream = Some(Box::new(Box::pin(stream))); }
                                 Err(e) => { let _ = err_tx.send(format!("WS SDK sub error: {}", e)); }
                             }
                             info!("WS SDK: seamlessly subscribed to {} tokens", active_tokens.len());
@@ -198,6 +227,32 @@ async fn ws_market_loop(
                     }
                     Err(e) => {
                         warn!("WS SDK PriceChange error: {}", e);
+                    }
+                }
+            }
+
+            Some(resolved_res) = async {
+                match resolved_stream.as_mut() {
+                    Some(s) => s.next().await,
+                    None => futures_util::future::pending().await,
+                }
+            } => {
+                match resolved_res {
+                    Ok(ev) => {
+                        let msg = json!({
+                            "event_type": "market_resolved",
+                            "market": ev.market.to_string(),
+                            "question": ev.question,
+                            "slug": ev.slug,
+                            "winning_asset_id": ev.winning_asset_id.to_string(),
+                            "winning_outcome": ev.winning_outcome,
+                            "asset_ids": ev.asset_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                            "timestamp": ev.timestamp.to_string(),
+                        });
+                        let _ = market_events_tx.send(msg);
+                    }
+                    Err(e) => {
+                        warn!("WS SDK MarketResolved error: {}", e);
                     }
                 }
             }

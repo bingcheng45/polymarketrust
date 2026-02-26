@@ -343,6 +343,21 @@ pub struct WsTradeEvent {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsMarketResolvedEvent {
+    pub event_type: String, // "market_resolved"
+    pub market: String, // condition ID
+    #[serde(default)]
+    pub question: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+    pub winning_asset_id: String,
+    pub winning_outcome: String,
+    #[serde(default)]
+    pub asset_ids: Vec<String>,
+    pub timestamp: String,
+}
+
 // ─── Gas Cache ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

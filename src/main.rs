@@ -5,7 +5,6 @@
 //!   - Initialize market monitor (balance, positions, WS)
 //!   - Run check_opportunity every ~1 second
 //!   - Run maker_fills check every 2 seconds
-//!   - Run redeem_resolved_positions every 20 seconds
 //!   - Run WS health check every 30 seconds
 //!   - Flush stats and shutdown gracefully on SIGINT/SIGTERM
 
@@ -97,7 +96,6 @@ async fn main() -> Result<()> {
 
     let monitor_arb = Arc::clone(&monitor);
     let monitor_maker = Arc::clone(&monitor);
-    let monitor_redeem = Arc::clone(&monitor);
     let monitor_ws = Arc::clone(&monitor);
 
     // 1. Opportunity check — WS-driven (event-based with 20ms throttle) with 5s REST heartbeat fallback
@@ -149,17 +147,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 3. Redeem resolved positions every 20 seconds
-    let redeem_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(20));
-        loop {
-            interval.tick().await;
-            let mut m = monitor_redeem.lock().await;
-            m.redeem_resolved_positions().await;
-        }
-    });
-
-    // 4. WS health check every 30 seconds
+    // 3. WS health check every 30 seconds
     let ws_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -176,7 +164,6 @@ async fn main() -> Result<()> {
     // Abort all tasks
     arb_handle.abort();
     maker_handle.abort();
-    redeem_handle.abort();
     ws_handle.abort();
 
     // Graceful shutdown
