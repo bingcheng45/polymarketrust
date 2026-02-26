@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Polymarket arbitrage bot - Rust implementation"
 authors = ["bingcheng45"]
+default-run = "polymarketrust"
 
 [lib]
 name = "polymarketrust"
@@ -51,9 +52,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 
-# Ethereum / Polygon (valid features for ethers v2)
-ethers = { version = "2", features = ["rustls", "abigen"] }
-
 # Cryptography (for CLOB API auth)
 hmac = "0.12"
 sha2 = "0.10"
@@ -64,6 +62,8 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+polymarket-client-sdk = { version = "0.4", features = ["gamma", "data", "bridge", "clob", "ctf", "ws"] }
+alloy = { version = "1.7.3", features = ["providers", "sol-types", "contract", "reqwest", "reqwest-rustls-tls", "signer-local", "signers"] }
 
 [profile.release]
 opt-level = 3

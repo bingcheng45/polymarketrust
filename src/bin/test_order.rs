@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Arc::new(Config::load().context("Failed to load config")?);
-    let client = ClobClient::new(Arc::clone(&config)).context("Failed to build CLOB client")?;
+    let client = ClobClient::new(Arc::clone(&config)).await.context("Failed to build CLOB client")?;
 
     println!("Signer  : {:?}", client.signer_address());
     println!("Maker   : {:?}", client.maker_address());
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-    let resp = client.post_order(&order, "GTC").await?;
+    let resp = client.post_order(order, "GTC").await?;
     let order_id = &resp.order_id;
 
     if order_id.is_empty() {

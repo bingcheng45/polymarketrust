@@ -6,9 +6,10 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ethers::core::k256::ecdsa::SigningKey;
-use ethers::prelude::*;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::SignerSync;
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,24 +20,26 @@ async fn main() -> Result<()> {
         .trim_start_matches("0x")
         .to_string();
 
-    let private_key_bytes = hex::decode(&private_key).context("Invalid PRIVATE_KEY hex")?;
-    let signing_key = SigningKey::from_bytes(private_key_bytes.as_slice().into())
-        .context("Invalid private key bytes")?;
-    let wallet = LocalWallet::from(signing_key);
-    let address = wallet.address();
+    let signer = PrivateKeySigner::from_str(&private_key)
+        .context("Invalid private key")?;
+    let address = signer.address();
 
-    println!("Wallet address : {address:?}");
+    println!("Wallet address : {address}");
     println!("Deriving API credentials…\n");
 
     let derivation_msg =
         "This message is used to generate a Polymarket CLOB API key. Please sign this message.";
 
-    let signature = wallet
-        .sign_message(derivation_msg)
-        .await
+    let signature = signer
+        .sign_message_sync(derivation_msg.as_bytes())
         .context("Failed to sign derivation message")?;
 
-    let sig_bytes = signature.to_vec();
+    // Convert signature to 65-byte array [r(32) || s(32) || v(1)]
+    // alloy stores v as parity (0/1); add 27 to match ethers.js personal_sign convention.
+    let mut sig_bytes = signature.as_bytes().to_vec();
+    if sig_bytes[64] < 27 {
+        sig_bytes[64] += 27;
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(&sig_bytes);

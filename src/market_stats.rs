@@ -17,6 +17,11 @@ pub struct MarketStatsTracker {
 }
 
 impl MarketStatsTracker {
+    /// Number of successful arb executions.
+    pub fn successes(&self) -> u64 {
+        self.stats.successes
+    }
+
     pub async fn load() -> Result<Self> {
         let path = PathBuf::from("logs/market_stats.json");
         if let Some(parent) = path.parent() {

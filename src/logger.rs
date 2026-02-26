@@ -4,7 +4,7 @@
 //! Uses an async queue so log writes never block the hot trading path.
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use std::path::PathBuf;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -14,13 +14,13 @@ use tracing::warn;
 #[derive(Debug)]
 enum LogMsg {
     Line(String),
-    Flush,
     Close,
 }
 
 pub struct SessionLogger {
     sender: mpsc::Sender<LogMsg>,
     path: PathBuf,
+    join_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SessionLogger {
@@ -43,7 +43,7 @@ impl SessionLogger {
         let (sender, mut rx) = mpsc::channel::<LogMsg>(1024);
         let path_clone = path.clone();
 
-        tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             let mut file = match OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -63,9 +63,6 @@ impl SessionLogger {
                         let _ = file.write_all(line.as_bytes()).await;
                         let _ = file.write_all(b"\n").await;
                     }
-                    LogMsg::Flush => {
-                        let _ = file.flush().await;
-                    }
                     LogMsg::Close => {
                         let _ = file.flush().await;
                         break;
@@ -74,7 +71,11 @@ impl SessionLogger {
             }
         });
 
-        let logger = Self { sender, path };
+        let logger = Self {
+            sender,
+            path,
+            join_handle: Some(join_handle),
+        };
 
         // Write session header
         let key_hint = if private_key_hint.len() >= 8 {
@@ -105,13 +106,13 @@ impl SessionLogger {
 
     /// Log an action with a timestamp prefix.
     pub async fn log(&self, msg: &str) {
-        let ts = Utc::now().format("%H:%M:%S%.3f");
+        let ts = Local::now().format("%I:%M:%S %p");
         self.write_raw(&format!("[{ts}] {msg}")).await;
     }
 
     /// Log an error.
     pub async fn error(&self, msg: &str) {
-        let ts = Utc::now().format("%H:%M:%S%.3f");
+        let ts = Local::now().format("%I:%M:%S %p");
         self.write_raw(&format!("[{ts}] ERROR: {msg}")).await;
     }
 
@@ -120,18 +121,31 @@ impl SessionLogger {
     }
 
     /// Flush the error summary and close the log file.
-    pub async fn close(&self, errors: &[String]) {
-        self.write_raw("───────────────────────────────────────────────────────────").await;
+    pub async fn close(&mut self, errors: &[String]) {
+        let now = chrono::Local::now().format("%d/%m/%Y, %l:%M:%S %p").to_string().to_lowercase();
+        
+        self.write_raw("===============================================================").await;
         if errors.is_empty() {
-            self.write_raw("  No errors this session.").await;
+            self.write_raw("✅ ERRORS ENCOUNTERED: None").await;
+            self.write_raw("===============================================================").await;
+            self.write_raw(&format!("⏹ Session End: {}", now)).await;
+            self.write_raw("===============================================================").await;
         } else {
-            self.write_raw(&format!("  Error summary ({} errors):", errors.len())).await;
+            self.write_raw(&format!("🔴 ERRORS ENCOUNTERED ({} total)", errors.len())).await;
+            self.write_raw("===============================================================").await;
             for e in errors {
-                self.write_raw(&format!("    - {e}")).await;
+                self.write_raw(e).await;
             }
+            self.write_raw("===============================================================").await;
+            self.write_raw(&format!("⏹ Session End: {}", now)).await;
+            self.write_raw("===============================================================").await;
         }
-        self.write_raw("═══════════════════════════════════════════════════════════").await;
+        
         let _ = self.sender.send(LogMsg::Close).await;
+        
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.await;
+        }
     }
 
     pub fn path(&self) -> &PathBuf {

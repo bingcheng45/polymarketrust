@@ -106,7 +106,7 @@ impl MakerStrategy {
 
         // Post both
         let results = client
-            .post_orders(&[&yes_order, &no_order], "GTC")
+            .post_orders(vec![yes_order, no_order], "GTC")
             .await?;
 
         if results.len() >= 2 {
@@ -130,7 +130,7 @@ impl MakerStrategy {
     pub async fn check_fills(
         &mut self,
         client: &ClobClient,
-        condition_id: &str,
+        _condition_id: &str,
     ) -> Result<(f64, f64)> {
         let mut yes_filled = 0.0_f64;
         let mut no_filled = 0.0_f64;

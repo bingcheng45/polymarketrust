@@ -122,18 +122,6 @@ impl Config {
         })
     }
 
-    /// Compute per-share fee for a given price.
-    /// fee = CLOB_FEE_RATE × (price × (1 − price))^CLOB_FEE_EXPONENT
-    pub fn fee_per_share(&self, price: f64) -> f64 {
-        let inner = price * (1.0 - price);
-        self.clob_fee_rate * inner.powf(self.clob_fee_exponent)
-    }
-
-    /// Maximum fee per share across both YES and NO legs.
-    pub fn max_fee_per_share(&self, yes_price: f64, no_price: f64) -> f64 {
-        f64::max(self.fee_per_share(yes_price), self.fee_per_share(no_price))
-    }
-
     /// Whether this config uses a proxy wallet.
     pub fn uses_proxy(&self) -> bool {
         self.signature_type >= 1

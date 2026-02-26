@@ -3,8 +3,9 @@
 //! Usage: cargo run --bin check_proxy
 
 use anyhow::{Context, Result};
-use ethers::core::k256::ecdsa::SigningKey;
-use ethers::prelude::*;
+use alloy::primitives::Address;
+use alloy::signers::local::PrivateKeySigner;
+use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,15 +22,14 @@ async fn main() -> Result<()> {
         .parse()
         .unwrap_or(0);
 
-    let private_key_bytes = hex::decode(&private_key).context("Invalid PRIVATE_KEY")?;
-    let signing_key = SigningKey::from_bytes(private_key_bytes.as_slice().into())?;
-    let wallet = LocalWallet::from(signing_key);
-    let signer_address = wallet.address();
+    let signer = PrivateKeySigner::from_str(&private_key)
+        .context("Invalid PRIVATE_KEY")?;
+    let signer_address = signer.address();
 
     println!("═══════════════════════════════════════");
     println!("  Polymarket Proxy Wallet Diagnostics");
     println!("═══════════════════════════════════════");
-    println!("Signer address : {signer_address:?}");
+    println!("Signer address : {signer_address}");
     println!("Signature type : {signature_type}");
 
     let check_address = if signature_type >= 1 {
@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
         let proxy: Address = proxy_address_str
             .parse()
             .context("Invalid POLY_PROXY_ADDRESS")?;
-        println!("Proxy address  : {proxy:?}");
+        println!("Proxy address  : {proxy}");
         proxy
     } else {
         signer_address
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     let usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
     let call_data = format!(
         "0x70a08231000000000000000000000000{}",
-        hex::encode(check_address.as_bytes())
+        hex::encode(check_address.as_slice())
     );
 
     let body = serde_json::json!({

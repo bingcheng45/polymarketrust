@@ -1,35 +1,28 @@
-//! Real-time WebSocket orderbook client (replicates ws_client.ts).
+//! Real-time WebSocket orderbook client using `polymarket-client-sdk`.
 //!
-//! Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`,
-//! subscribes to token IDs, and maintains a local cache of the latest
-//! full orderbook snapshot for each token.  Supports incremental
-//! price-change updates and sends a PING heartbeat every 10 seconds
-//! (matching TypeScript's HEARTBEAT_MS = 10_000) — the connection is
-//! considered dead and reconnected if no PONG is received within 15 s.
+//! Maintains a local cache of the latest full orderbook snapshot for each token.
+//! Uses the official SDK's built-in background connection manager, removing the 
+//! need for manual ping/pong and reconnect logic.
 
-use crate::types::{OrderBook, PriceLevel, WsBookEvent, WsPriceChangeEvent};
+use crate::types::{OrderBook, PriceLevel};
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
+use polymarket_client_sdk::auth::Credentials;
+use polymarket_client_sdk::clob::ws::Client;
+use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, PriceChange, WsMessage};
+use polymarket_client_sdk::error::Error as SdkError;
+use polymarket_client_sdk::types::{Address, U256};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, info, warn};
+use std::time::Instant;
+use tokio::sync::{mpsc, Notify, RwLock};
+use tracing::{info, warn};
 
-const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 /// Books older than this are considered stale (WS-primary fetch falls back to REST).
 const STALE_THRESHOLD_MS: u64 = 5_000;
-/// Initial reconnect wait.
-const RECONNECT_BASE_MS: u64 = 1_000;
-/// Maximum reconnect wait.
-const RECONNECT_MAX_MS: u64 = 30_000;
-/// How often we send a PING frame (matches TypeScript HEARTBEAT_MS).
-const PING_INTERVAL_SECS: u64 = 10;
-/// If no message arrives within this many seconds of a PING we reconnect.
-const PONG_TIMEOUT_SECS: u64 = 15;
 
 struct BookEntry {
     book: OrderBook,
@@ -38,32 +31,51 @@ struct BookEntry {
 
 pub struct WsClient {
     books: Arc<RwLock<HashMap<String, BookEntry>>>,
-    subscribed: Arc<RwLock<Vec<String>>>,
+    is_market_connected: Arc<AtomicBool>,
+    is_user_connected: Arc<AtomicBool>,
+    cmd_tx: mpsc::UnboundedSender<Vec<String>>,
+    pub error_rx: mpsc::UnboundedReceiver<String>,
+    pub user_events_rx: mpsc::UnboundedReceiver<Value>,
 }
 
 impl WsClient {
-    /// Create the client and immediately start the background WS loop.
-    /// Returns the client plus an `mpsc::Receiver` that fires on every book update.
+    /// Create the client and immediately start the background WS loops.
+    /// Returns the client plus a `Notify` that fires on every book update.
     pub async fn connect(
         token_ids: Vec<String>,
-    ) -> Result<(Self, mpsc::Receiver<(String, OrderBook)>)> {
+        poly_api_key: String,
+        poly_api_secret: String,
+        poly_api_passphrase: String,
+    ) -> Result<(Self, Arc<Notify>)> {
         let books: Arc<RwLock<HashMap<String, BookEntry>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let (update_tx, update_rx) = mpsc::channel::<(String, OrderBook)>(512);
-        let subscribed = Arc::new(RwLock::new(token_ids));
+        let notify = Arc::new(Notify::new());
+        let is_market_connected = Arc::new(AtomicBool::new(false));
+        let is_user_connected = Arc::new(AtomicBool::new(false));
+        
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (err_tx, err_rx) = mpsc::unbounded_channel();
+        let (user_events_tx, user_events_rx) = mpsc::unbounded_channel();
 
         let books_clone = Arc::clone(&books);
-        let tx_clone = update_tx.clone();
-        let sub_clone = Arc::clone(&subscribed);
+        let notify_clone = notify.clone();
+        let is_market_connected_clone = Arc::clone(&is_market_connected);
+        
+        let _ = cmd_tx.send(token_ids);
 
+        let err_tx_market = err_tx.clone();
         tokio::spawn(async move {
-            ws_loop(books_clone, tx_clone, sub_clone).await;
+            ws_market_loop(books_clone, notify_clone, cmd_rx, err_tx_market, is_market_connected_clone).await;
         });
 
-        Ok((Self { books, subscribed }, update_rx))
+        let is_user_connected_clone = Arc::clone(&is_user_connected);
+        tokio::spawn(async move {
+            ws_user_loop(poly_api_key, poly_api_secret, poly_api_passphrase, user_events_tx, err_tx, is_user_connected_clone).await;
+        });
+
+        Ok((Self { books, is_market_connected, is_user_connected, cmd_tx, error_rx: err_rx, user_events_rx }, notify))
     }
 
-    /// Returns the cached book if it is fresh (< 5 s old).
     pub async fn get_order_book(&self, token_id: &str) -> Option<OrderBook> {
         let books = self.books.read().await;
         books.get(token_id).and_then(|e| {
@@ -75,7 +87,6 @@ impl WsClient {
         })
     }
 
-    /// Age of the cached book in milliseconds, or `None` if not present.
     pub async fn get_book_age_ms(&self, token_id: &str) -> Option<u64> {
         let books = self.books.read().await;
         books
@@ -83,233 +94,278 @@ impl WsClient {
             .map(|e| e.updated_at.elapsed().as_millis() as u64)
     }
 
-    /// Update the subscription list (called on market rollover).
     pub async fn resubscribe(&self, token_ids: Vec<String>) {
-        let mut sub = self.subscribed.write().await;
-        *sub = token_ids;
-        // The running WS loop will pick up the new list on next reconnect.
-        // For an immediate re-sub we rely on the health check triggering a reconnect.
+        let _ = self.cmd_tx.send(token_ids);
     }
 
-    /// True if the book for `token_id` was updated within the last 60 s.
-    pub async fn is_healthy(&self, token_id: &str) -> bool {
-        self.get_book_age_ms(token_id)
-            .await
-            .map(|age| age < 60_000)
-            .unwrap_or(false)
+    pub async fn is_healthy(&self, _token_id: &str) -> bool {
+        self.is_market_connected.load(Ordering::Relaxed) && self.is_user_connected.load(Ordering::Relaxed)
     }
 }
 
-// ─── Background WS loop ──────────────────────────────────────────────────────
-
-async fn ws_loop(
+async fn ws_market_loop(
     books: Arc<RwLock<HashMap<String, BookEntry>>>,
-    tx: mpsc::Sender<(String, OrderBook)>,
-    subscribed: Arc<RwLock<Vec<String>>>,
+    notify: Arc<Notify>,
+    mut cmd_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    err_tx: mpsc::UnboundedSender<String>,
+    is_connected: Arc<AtomicBool>,
 ) {
-    let mut backoff_ms = RECONNECT_BASE_MS;
+    let client = Client::default();
+    is_connected.store(true, Ordering::Relaxed); // Connection managed internally by SDK
+
+    let mut active_tokens: Vec<U256> = Vec::new();
+    let mut orderbook_stream: Option<Box<dyn futures_util::Stream<Item = std::result::Result<BookUpdate, SdkError>> + Unpin + Send>> = None;
+    let mut prices_stream: Option<Box<dyn futures_util::Stream<Item = std::result::Result<PriceChange, SdkError>> + Unpin + Send>> = None;
 
     loop {
-        info!("WS: connecting to {WS_URL}");
-
-        let conn = timeout(Duration::from_secs(10), connect_async(WS_URL)).await;
-
-        match conn {
-            Err(_) => warn!("WS: connect timed out, retry in {backoff_ms}ms"),
-            Ok(Err(e)) => warn!("WS: connect error: {e}, retry in {backoff_ms}ms"),
-            Ok(Ok((ws_stream, _))) => {
-                info!("WS: connected");
-                backoff_ms = RECONNECT_BASE_MS; // Reset on success
-
-                let (mut write, mut read) = ws_stream.split();
-
-                // Send subscription message
-                let token_ids = subscribed.read().await.clone();
-                let sub_msg = json!({ "assets_ids": token_ids, "type": "market" });
-                if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
-                    warn!("WS: subscribe failed: {e}");
-                    // fall through to reconnect
-                } else {
-                    info!("WS: subscribed to {} tokens", token_ids.len());
-
-                    // Ping interval + pong deadline tracking
-                    let mut ping_ticker = interval(Duration::from_secs(PING_INTERVAL_SECS));
-                    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    let mut last_pong = Instant::now();
-                    let mut ping_sent = false;
-
-                    'read: loop {
-                        tokio::select! {
-                            // ── Incoming message ──────────────────────────
-                            msg = read.next() => {
-                                match msg {
-                                    None => {
-                                        warn!("WS: stream ended");
-                                        break 'read;
-                                    }
-                                    Some(Err(e)) => {
-                                        warn!("WS: read error: {e}");
-                                        break 'read;
-                                    }
-                                    Some(Ok(m)) => {
-                                        match m {
-                                            Message::Text(text) => {
-                                                last_pong = Instant::now(); // Any message resets deadline
-                                                ping_sent = false;
-                                                handle_message(&text, &books, &tx).await;
-                                            }
-                                            Message::Pong(_) => {
-                                                last_pong = Instant::now();
-                                                ping_sent = false;
-                                                debug!("WS: pong received");
-                                            }
-                                            Message::Ping(data) => {
-                                                // Server-initiated ping — respond immediately
-                                                let _ = write.send(Message::Pong(data)).await;
-                                            }
-                                            Message::Close(_) => {
-                                                info!("WS: server closed");
-                                                break 'read;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-
-                            // ── Heartbeat tick ────────────────────────────
-                            _ = ping_ticker.tick() => {
-                                // Check pong deadline first
-                                if ping_sent && last_pong.elapsed().as_secs() > PONG_TIMEOUT_SECS {
-                                    warn!("WS: pong timeout ({PONG_TIMEOUT_SECS}s), reconnecting");
-                                    break 'read;
-                                }
-
-                                // Send ping
-                                if write.send(Message::Ping(vec![])).await.is_err() {
-                                    warn!("WS: ping send failed, reconnecting");
-                                    break 'read;
-                                }
-                                ping_sent = true;
-                                debug!("WS: ping sent");
-                            }
+        tokio::select! {
+            cmd_opt = cmd_rx.recv() => {
+                match cmd_opt {
+                    Some(tokens_str) => {
+                        let tokens: Vec<U256> = tokens_str.iter()
+                            .filter_map(|t| U256::from_str(t).ok())
+                            .collect();
+                        
+                        if !active_tokens.is_empty() {
+                            let _ = client.unsubscribe_orderbook(&active_tokens);
+                            let _ = client.unsubscribe_prices(&active_tokens);
                         }
+                        
+                        active_tokens = tokens;
+                        
+                        if !active_tokens.is_empty() {
+                            match client.subscribe_orderbook(active_tokens.clone()) {
+                                Ok(stream) => { orderbook_stream = Some(Box::new(Box::pin(stream))); }
+                                Err(e) => { let _ = err_tx.send(format!("WS SDK sub error: {}", e)); }
+                            }
+                            match client.subscribe_prices(active_tokens.clone()) {
+                                Ok(stream) => { prices_stream = Some(Box::new(Box::pin(stream))); }
+                                Err(e) => { let _ = err_tx.send(format!("WS SDK sub error: {}", e)); }
+                            }
+                            info!("WS SDK: seamlessly subscribed to {} tokens", active_tokens.len());
+                        }
+                    }
+                    None => {
+                        info!("WS: client dropped, exiting market background task");
+                        return;
+                    }
+                }
+            }
+            
+            Some(book_res) = async {
+                match orderbook_stream.as_mut() {
+                    Some(s) => s.next().await,
+                    None => futures_util::future::pending().await,
+                }
+            } => {
+                match book_res {
+                    Ok(book) => {
+                        handle_book_message(book, &books, &notify).await;
+                    }
+                    Err(e) => {
+                        warn!("WS SDK Book error: {}", e);
+                    }
+                }
+            }
+
+            Some(price_res) = async {
+                match prices_stream.as_mut() {
+                    Some(s) => s.next().await,
+                    None => futures_util::future::pending().await,
+                }
+            } => {
+                match price_res {
+                    Ok(price) => {
+                        handle_price_change(price, &books, &notify).await;
+                    }
+                    Err(e) => {
+                        warn!("WS SDK PriceChange error: {}", e);
                     }
                 }
             }
         }
-
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(RECONNECT_MAX_MS);
     }
 }
 
-// ─── Message handlers ─────────────────────────────────────────────────────────
-
-async fn handle_message(
-    text: &str,
+async fn handle_book_message(
+    book: BookUpdate,
     books: &Arc<RwLock<HashMap<String, BookEntry>>>,
-    tx: &mpsc::Sender<(String, OrderBook)>,
+    notify: &Arc<Notify>,
 ) {
-    let value: Value = match serde_json::from_str(text) {
-        Ok(v) => v,
+    let mut order_book = OrderBook {
+        bids: book.bids.iter().map(|b| PriceLevel {
+            price: b.price.to_string(),
+            size: b.size.to_string(),
+        }).collect(),
+        asks: book.asks.iter().map(|a| PriceLevel {
+            price: a.price.to_string(),
+            size: a.size.to_string(),
+        }).collect(),
+        timestamp: Some(book.timestamp as u64),
+    };
+    order_book.sort();
+
+    let token_id_str = book.asset_id.to_string();
+    {
+        let mut w = books.write().await;
+        w.insert(
+            token_id_str,
+            BookEntry {
+                book: order_book,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+    notify.notify_one();
+}
+
+async fn handle_price_change(
+    ev: PriceChange,
+    books: &Arc<RwLock<HashMap<String, BookEntry>>>,
+    notify: &Arc<Notify>,
+) {
+    let mut books_w = books.write().await;
+    let mut overall_new = false;
+    
+    for change in &ev.price_changes {
+        let token_id_str = change.asset_id.to_string();
+        
+        let entry = books_w
+            .entry(token_id_str.clone())
+            .or_insert_with(|| BookEntry {
+                book: OrderBook::default(),
+                updated_at: Instant::now(),
+            });
+
+        let mut new_ask_level = false;
+        let mut new_bid_level = false;
+        let size_f64: f64 = change.size.map(|d| d.to_string().parse().unwrap_or(0.0)).unwrap_or(0.0);
+        let price_str = change.price.to_string();
+        let size_str = change.size.map(|s| s.to_string()).unwrap_or_else(|| "0".to_string());
+
+        let is_buy = matches!(change.side, polymarket_client_sdk::clob::types::Side::Buy);
+
+        if is_buy {
+            let levels = &mut entry.book.bids;
+            if size_f64 == 0.0 {
+                levels.retain(|l| l.price != price_str);
+            } else if let Some(level) = levels.iter_mut().find(|l| l.price == price_str) {
+                level.size = size_str;
+            } else {
+                levels.push(PriceLevel {
+                    price: price_str.clone(),
+                    size: size_str,
+                });
+                new_bid_level = true;
+            }
+        } else {
+            let levels = &mut entry.book.asks;
+            if size_f64 == 0.0 {
+                levels.retain(|l| l.price != price_str);
+            } else if let Some(level) = levels.iter_mut().find(|l| l.price == price_str) {
+                level.size = size_str;
+            } else {
+                levels.push(PriceLevel {
+                    price: price_str.clone(),
+                    size: size_str,
+                });
+                new_ask_level = true;
+            }
+        }
+
+        if new_ask_level || new_bid_level {
+            entry.book.sort();
+        }
+        entry.updated_at = Instant::now();
+        overall_new = true;
+    }
+    
+    drop(books_w);
+    if overall_new {
+        notify.notify_one();
+    }
+}
+
+async fn ws_user_loop(
+    api_key: String,
+    api_secret: String,
+    api_passphrase: String,
+    events_tx: mpsc::UnboundedSender<Value>,
+    err_tx: mpsc::UnboundedSender<String>,
+    is_connected: Arc<AtomicBool>,
+) {
+    let uuid_key = match uuid::Uuid::parse_str(&api_key) {
+        Ok(u) => u,
+        Err(_) => {
+            let _ = err_tx.send("WS User Error: API key is not valid UUID".to_string());
+            return;
+        }
+    };
+    
+    let credentials = Credentials::new(uuid_key, api_secret.clone(), api_passphrase.clone());
+    let address = Address::default();
+    
+    let auth_client = match Client::default().authenticate(credentials, address) {
+        Ok(c) => c,
         Err(e) => {
-            debug!("WS: JSON parse error: {e}");
+            let _ = err_tx.send(format!("WS User Error on Auth: {}", e));
+            return;
+        }
+    };
+    
+    is_connected.store(true, Ordering::Relaxed);
+    info!("WS SDK User: connected securely");
+
+    let stream_res = auth_client.subscribe_user_events(vec![]);
+    let mut stream = match stream_res {
+        Ok(s) => Box::pin(s),
+        Err(e) => {
+            let _ = err_tx.send(format!("WS SDK User stream error: {}", e));
             return;
         }
     };
 
-    let events = match value {
-        Value::Array(arr) => arr,
-        single => vec![single],
-    };
-
-    for event in events {
-        let event_type = event
-            .get("event_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        match event_type {
-            "book" => {
-                if let Ok(ev) = serde_json::from_value::<WsBookEvent>(event) {
-                    let ts = ev
-                        .timestamp
-                        .as_deref()
-                        .and_then(|s| s.parse::<u64>().ok());
-                    let mut book = OrderBook {
-                        bids: ev.bids,
-                        asks: ev.asks,
-                        timestamp: ts,
-                    };
-                    book.sort();
-
-                    let token_id = ev.asset_id.clone();
-                    {
-                        let mut w = books.write().await;
-                        w.insert(
-                            token_id.clone(),
-                            BookEntry {
-                                book: book.clone(),
-                                updated_at: Instant::now(),
-                            },
-                        );
-                    }
-                    let _ = tx.try_send((token_id, book));
-                }
+    while let Some(msg_res) = stream.next().await {
+        match msg_res {
+            Ok(WsMessage::Order(o)) => {
+                let v = json!({
+                    "event_type": "order",
+                    "id": o.id,
+                    "owner": o.owner.map(|a| a.to_string()).unwrap_or_default(),
+                    "market": o.market.to_string(),
+                    "asset_id": o.asset_id.to_string(),
+                    "side": format!("{:?}", o.side).to_uppercase(),
+                    "original_size": o.original_size.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+                    "size_matched": o.size_matched.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+                    "price": o.price.to_string(),
+                    "outcome": o.outcome,
+                    "status": o.status.map(|s| format!("{:?}", s).to_uppercase()).unwrap_or_else(|| "UNKNOWN".to_string())
+                });
+                let _ = events_tx.send(v);
             }
-            "price_change" => {
-                if let Ok(ev) = serde_json::from_value::<WsPriceChangeEvent>(event) {
-                    apply_price_change(&ev, books, tx).await;
-                }
+            Ok(WsMessage::Trade(t)) => {
+                let v = json!({
+                    "event_type": "trade",
+                    "id": t.id,
+                    "taker_order_id": t.taker_order_id.unwrap_or_default(),
+                    "market": t.market.to_string(),
+                    "asset_id": t.asset_id.to_string(),
+                    "side": format!("{:?}", t.side).to_uppercase(),
+                    "size": t.size.to_string(),
+                    "price": t.price.to_string(),
+                    "status": format!("{:?}", t.status).to_uppercase(),
+                    "matchtime": t.matchtime.map(|m| m.to_string()).unwrap_or_default(),
+                    "timestamp": t.timestamp.map(|m| m.to_string()).unwrap_or_default()
+                });
+                let _ = events_tx.send(v);
             }
-            _ => {}
+            Ok(_) => {} // ignore other types
+            Err(e) => {
+                warn!("WS SDK User event error: {}", e);
+            }
         }
     }
-}
-
-/// Apply an incremental price-change delta to the cached book.
-async fn apply_price_change(
-    ev: &WsPriceChangeEvent,
-    books: &Arc<RwLock<HashMap<String, BookEntry>>>,
-    tx: &mpsc::Sender<(String, OrderBook)>,
-) {
-    let mut books_w = books.write().await;
-    let entry = books_w
-        .entry(ev.asset_id.clone())
-        .or_insert_with(|| BookEntry {
-            book: OrderBook::default(),
-            updated_at: Instant::now(),
-        });
-
-    let size: f64 = ev.size.parse().unwrap_or(0.0);
-    let side_lower = ev.side.to_lowercase();
-    let levels = if side_lower == "bid" {
-        &mut entry.book.bids
-    } else {
-        &mut entry.book.asks
-    };
-
-    if size == 0.0 {
-        // Level removed — price hit zero liquidity
-        levels.retain(|l| l.price != ev.price);
-    } else if let Some(level) = levels.iter_mut().find(|l| l.price == ev.price) {
-        // Update existing level
-        level.size = ev.size.clone();
-    } else {
-        // New price level
-        levels.push(PriceLevel {
-            price: ev.price.clone(),
-            size: ev.size.clone(),
-        });
-    }
-
-    entry.book.sort();
-    entry.updated_at = Instant::now();
-
-    let book = entry.book.clone();
-    let token_id = ev.asset_id.clone();
-    drop(books_w);
-
-    let _ = tx.try_send((token_id, book));
+    
+    is_connected.store(false, Ordering::Relaxed);
+    info!("WS SDK User: stream ended");
 }

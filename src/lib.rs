@@ -1,5 +1,6 @@
 pub mod clob_client;
 pub mod config;
+pub mod dashboard;
 pub mod logger;
 pub mod maker_strategy;
 pub mod market_monitor;

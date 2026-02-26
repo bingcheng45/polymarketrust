@@ -13,16 +13,21 @@ use anyhow::Result;
 use polymarketrust::clob_client::ClobClient;
 use polymarketrust::config::Config;
 use polymarketrust::market_monitor::MarketMonitor;
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Mutex;
-use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ─── Tracing / Logging ────────────────────────────────────────────────────
+    // ─── Tracing / Logging (→ file, not stdout) ──────────────────────────────
+    //
+    // The TUI dashboard owns stdout. All tracing output goes to logs/bot.log
+    // so it doesn't interleave with the dashboard rendering.
+    fs::create_dir_all("logs").ok();
+    let log_file = fs::File::create("logs/bot.log")?;
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("RUST_LOG")
@@ -30,45 +35,49 @@ async fn main() -> Result<()> {
         )
         .with_target(false)
         .compact()
+        .with_ansi(false)
+        .with_writer(log_file)
         .init();
 
-    info!("═══════════════════════════════════════════════════════");
-    info!("  POLYMARKETRUST — Polymarket Arbitrage Bot (Rust)");
-    info!("═══════════════════════════════════════════════════════");
+    // Print startup banner to stdout (visible before dashboard takes over)
+    println!("═══════════════════════════════════════════════════════");
+    println!("  POLYMARKETRUST — Polymarket Arbitrage Bot (Rust)");
+    println!("═══════════════════════════════════════════════════════");
 
     // ─── Config ───────────────────────────────────────────────────────────────
     let config = match Config::load() {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            error!("Config error: {e}");
-            error!("Copy .env.example to .env and fill in your credentials.");
+            eprintln!("Config error: {e}");
+            eprintln!("Copy .env.example to .env and fill in your credentials.");
             std::process::exit(1);
         }
     };
 
-    info!("Market slugs : {}", config.market_slugs.join(", "));
-    info!("Max trade    : {} shares", config.max_trade_size);
-    info!("Min profit   : ${}", config.min_net_profit_usd);
-    info!("Mock mode    : {}", config.mock_currency);
-    info!("Sig type     : {}", config.signature_type);
+    println!("Market slugs : {}", config.market_slugs.join(", "));
+    println!("Max trade    : {} shares", config.max_trade_size);
+    println!("Min profit   : ${}", config.min_net_profit_usd);
+    println!("Mock mode    : {}", config.mock_currency);
+    println!("Sig type     : {}", config.signature_type);
 
     // ─── CLOB Client ─────────────────────────────────────────────────────────
-    let client = match ClobClient::new(Arc::clone(&config)) {
+    let client = match ClobClient::new(Arc::clone(&config)).await {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            error!("Failed to build CLOB client: {e}");
+            eprintln!("Failed to build CLOB client: {e}");
             std::process::exit(1);
         }
     };
 
-    info!("Signer  : {:?}", client.signer_address());
-    info!("Maker   : {:?}", client.maker_address());
+    println!("Signer  : {}", client.signer_address());
+    println!("Maker   : {}", client.maker_address());
+    println!("Initializing...");
 
     // ─── Market Monitor ──────────────────────────────────────────────────────
     let monitor = match MarketMonitor::new(Arc::clone(&config), Arc::clone(&client)).await {
         Ok(m) => Arc::new(Mutex::new(m)),
         Err(e) => {
-            error!("Failed to create market monitor: {e}");
+            eprintln!("Failed to create market monitor: {e}");
             std::process::exit(1);
         }
     };
@@ -77,12 +86,12 @@ async fn main() -> Result<()> {
     {
         let mut m = monitor.lock().await;
         if let Err(e) = m.initialize().await {
-            error!("Initialization failed: {e}");
+            eprintln!("Initialization failed: {e}");
             std::process::exit(1);
         }
     }
 
-    info!("Bot running — press Ctrl+C to stop");
+    // Dashboard will clear the screen on first render
 
     // ─── Scheduler ───────────────────────────────────────────────────────────
 
@@ -91,13 +100,42 @@ async fn main() -> Result<()> {
     let monitor_redeem = Arc::clone(&monitor);
     let monitor_ws = Arc::clone(&monitor);
 
-    // 1. Opportunity check every ~1 second
+    // 1. Opportunity check — WS-driven (event-based with 20ms throttle) with 5s REST heartbeat fallback
+    //    Mirrors TypeScript bot: fires checkOpportunity() instantly on WS book updates.
+    //    Runs REST every 5s as a heartbeat if WS is quiet.
     let arb_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(1_000));
+        const WS_THROTTLE: Duration = Duration::from_millis(20);
+        const REST_HEARTBEAT: Duration = Duration::from_millis(5_000);
+        const REST_FALLBACK: Duration = Duration::from_millis(1_000);
+        
+        let mut last_check = std::time::Instant::now() - WS_THROTTLE;
+
         loop {
-            interval.tick().await;
-            let mut m = monitor_arb.lock().await;
-            m.check_opportunity().await;
+            let notify_opt = { monitor_arb.lock().await.get_ws_notify() };
+
+            if let Some(notify) = notify_opt {
+                tokio::select! {
+                    _ = notify.notified() => {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_check) >= WS_THROTTLE {
+                            last_check = now;
+                            let mut m = monitor_arb.lock().await;
+                            m.check_opportunity().await;
+                        }
+                    }
+                    _ = tokio::time::sleep(REST_HEARTBEAT) => {
+                        // 5s Heartbeat when WS is connected but silent
+                        let mut m = monitor_arb.lock().await;
+                        m.check_opportunity().await;
+                    }
+                }
+            } else {
+                // Fully disconnected fallback: poll every 1s
+                let mut m = monitor_arb.lock().await;
+                m.check_opportunity().await;
+                drop(m);
+                tokio::time::sleep(REST_FALLBACK).await;
+            }
         }
     });
 
@@ -133,7 +171,7 @@ async fn main() -> Result<()> {
 
     // ─── Shutdown Signal ─────────────────────────────────────────────────────
     signal::ctrl_c().await?;
-    info!("Shutdown signal received");
+    println!("\nShutdown signal received");
 
     // Abort all tasks
     arb_handle.abort();
@@ -147,6 +185,6 @@ async fn main() -> Result<()> {
         m.shutdown().await;
     }
 
-    info!("Bye!");
+    println!("Bye!");
     Ok(())
 }

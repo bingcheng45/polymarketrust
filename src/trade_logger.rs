@@ -1,6 +1,7 @@
 //! JSONL trade event logger (replicates trade_logger.ts).
 //!
 //! Each trade is appended as a single JSON line to `logs/trades.jsonl`.
+//! Uses an async queue so log writes never block the hot trading path.
 
 use crate::types::{TradeLogEntry, TradeType};
 use anyhow::Result;
@@ -8,9 +9,17 @@ use chrono::Utc;
 use std::path::PathBuf;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tracing::warn;
 
+#[derive(Debug)]
+enum LogMsg {
+    Entry(TradeLogEntry),
+}
+
 pub struct TradeLogger {
+    sender: mpsc::Sender<LogMsg>,
+    #[allow(dead_code)]
     path: PathBuf,
 }
 
@@ -20,25 +29,45 @@ impl TradeLogger {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        Ok(Self { path })
+
+        let (sender, mut rx) = mpsc::channel::<LogMsg>(1024);
+        let path_clone = path.clone();
+
+        tokio::spawn(async move {
+            let mut file = match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path_clone)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!("TradeLogger: cannot open {}: {e}", path_clone.display());
+                    return;
+                }
+            };
+
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    LogMsg::Entry(entry) => {
+                        if let Ok(line) = serde_json::to_string(&entry) {
+                            let _ = file.write_all(line.as_bytes()).await;
+                            let _ = file.write_all(b"\n").await;
+                        }
+                    }
+                }
+            }
+            
+            let _ = file.flush().await;
+        });
+
+        Ok(Self { sender, path })
     }
 
     pub async fn log(&self, entry: TradeLogEntry) {
-        if let Err(e) = self.write_entry(&entry).await {
-            warn!("TradeLogger write error: {e}");
+        if let Err(e) = self.sender.send(LogMsg::Entry(entry)).await {
+            warn!("TradeLogger cache full or receiver dropped: {e}");
         }
-    }
-
-    async fn write_entry(&self, entry: &TradeLogEntry) -> Result<()> {
-        let line = serde_json::to_string(entry)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        Ok(())
     }
 
     pub async fn log_execution(

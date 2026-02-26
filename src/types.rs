@@ -33,6 +33,11 @@ impl OrderBook {
         self.asks.first().map(|l| l.price_f64())
     }
 
+    /// Size available at the best ask price level.
+    pub fn best_ask_size(&self) -> f64 {
+        self.asks.first().map(|l| l.size_f64()).unwrap_or(0.0)
+    }
+
     /// Best bid price (highest bid).
     pub fn best_bid(&self) -> Option<f64> {
         self.bids.first().map(|l| l.price_f64())
@@ -132,27 +137,7 @@ pub enum OrderStatus {
 }
 
 /// The EIP-712 signed order body submitted to the CLOB.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignedOrder {
-    pub salt: String,
-    pub maker: String,
-    pub signer: String,
-    pub taker: String,
-    #[serde(rename = "tokenId")]
-    pub token_id: String,
-    #[serde(rename = "makerAmount")]
-    pub maker_amount: String,
-    #[serde(rename = "takerAmount")]
-    pub taker_amount: String,
-    pub expiration: String,
-    pub nonce: String,
-    #[serde(rename = "feeRateBps")]
-    pub fee_rate_bps: String,
-    pub side: String,
-    #[serde(rename = "signatureType")]
-    pub signature_type: String,
-    pub signature: String,
-}
+pub use polymarket_client_sdk::clob::types::SignedOrder;
 
 /// Response from POST /order or POST /orders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,13 +298,49 @@ pub struct WsBookEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceChange {
+    pub price: String,
+    pub size: String,
+    pub side: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsPriceChangeEvent {
     pub event_type: String,
     pub asset_id: String,
-    pub side: String,
-    pub price: String,
-    pub size: String,
+    #[serde(default)]
+    pub changes: Vec<PriceChange>,
     pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsOrderEvent {
+    pub event_type: String, // "order"
+    pub id: String, // order hash
+    pub owner: String, // eoa/proxy
+    pub market: String, // condition ID
+    pub asset_id: String, // token ID
+    pub side: String, // "BUY" | "SELL"
+    pub original_size: String,
+    pub size_matched: String,
+    pub price: String,
+    pub outcome: Option<String>, // "YES" | "NO"
+    pub status: String, // "LIVE" | "MATCHED" | "PARTIALLY_MATCHED" | "CANCELED"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsTradeEvent {
+    pub event_type: String, // "trade"
+    pub id: String, // trade ID
+    pub taker_order_id: String,
+    pub market: String, // condition ID
+    pub asset_id: String, // token ID
+    pub side: String, // "BUY" | "SELL"
+    pub size: String,
+    pub price: String,
+    pub status: String, // "MATCHED"
+    pub matchtime: String,
+    pub timestamp: String,
 }
 
 // ─── Gas Cache ────────────────────────────────────────────────────────────────
@@ -361,12 +382,29 @@ pub struct BalanceAllowance {
 
 impl BalanceAllowance {
     pub fn balance_f64(&self) -> f64 {
-        self.balance.parse().unwrap_or(0.0)
+        // CLOB returns balance in micro-USDC (6 decimals): "30980000" = $30.98
+        let raw: f64 = self.balance.parse().unwrap_or(0.0);
+        raw / 1_000_000.0
     }
 }
 
 // ─── Gamma API (market discovery) ────────────────────────────────────────────
 
+/// Top-level event returned by GET /events on the Gamma API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GammaEvent {
+    pub slug: Option<String>,
+    #[serde(rename = "endDate")]
+    pub end_date: Option<String>,
+    #[serde(default)]
+    pub markets: Option<Vec<GammaMarket>>,
+}
+
+/// A market nested inside a GammaEvent.
+///
+/// Token IDs and outcomes are JSON-encoded strings from the API, e.g.:
+///   `clobTokenIds`: `"[\"id1\",\"id2\"]"`
+///   `outcomes`:     `"[\"Up\",\"Down\"]"`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GammaMarket {
     #[serde(rename = "conditionId")]
@@ -377,13 +415,62 @@ pub struct GammaMarket {
     pub end_date: Option<String>,
     #[serde(rename = "negRisk", default)]
     pub neg_risk: bool,
-    #[serde(rename = "tickSize")]
+    /// JSON string: `"[\"token_id_1\",\"token_id_2\"]"`
+    #[serde(rename = "clobTokenIds")]
+    pub clob_token_ids: Option<String>,
+    /// JSON string: `"[\"Up\",\"Down\"]"` or `"[\"Yes\",\"No\"]"`
+    pub outcomes: Option<String>,
+    #[serde(rename = "enableOrderBook", default)]
+    pub enable_order_book: Option<bool>,
+    #[serde(rename = "orderPriceMinTickSize")]
     pub tick_size: Option<f64>,
-    pub tokens: Option<Vec<GammaToken>>,
+    #[serde(default)]
+    pub closed: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GammaToken {
-    pub token_id: String,
-    pub outcome: String,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_position_balanced() {
+        let mut pos = Position::default();
+        assert!(pos.is_balanced());
+        
+        pos.yes_size = 50.0;
+        pos.no_size = 50.0;
+        assert!(pos.is_balanced());
+        
+        pos.yes_size = 50.0;
+        pos.no_size = 49.0;
+        assert!(!pos.is_balanced());
+    }
+
+    #[test]
+    fn test_position_mergeable_amount() {
+        let pos = Position {
+            yes_size: 100.0,
+            no_size: 150.0,
+            yes_cost: 0.0,
+            no_cost: 0.0,
+        };
+        assert_eq!(pos.mergeable_amount(), 100.0);
+    }
+
+    #[test]
+    fn test_position_has_imbalance() {
+        let pos = Position {
+            yes_size: 100.0,
+            no_size: 50.0,
+            ..Default::default()
+        };
+        assert!(pos.has_imbalance());
+        
+        let pos2 = Position {
+            yes_size: 100.0,
+            no_size: 100.0,
+            ..Default::default()
+        };
+        assert!(!pos2.has_imbalance());
+    }
 }
