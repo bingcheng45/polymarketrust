@@ -721,7 +721,9 @@ impl MarketMonitor {
             self.stats.record_opportunity(net_spread);
             self.opportunity_detected_count = self.opportunity_detected_count.saturating_add(1);
 
-            let arb_msg = format!("🚨 ARB OPPORTUNITY! Cost: {:.2}", total_cost);
+            let arb_msg = format!(
+                "🚨 ARB OPPORTUNITY: pair cost ${total_cost:.3}/share vs fee-adjusted cap ${effective_threshold:.3}/share (edge ${net_spread:.3}/share)"
+            );
             self.log_action(&arb_msg).await;
         } else {
             self.request_render();
@@ -730,6 +732,9 @@ impl MarketMonitor {
 
         // Maker mode: post limit orders instead of taking
         if self.config.maker_mode_enabled {
+            self.log_action_fast(
+                "🧾 ORDER SEND (taker): NO — maker mode is enabled, posting/refreshing resting bids instead.",
+            );
             if let Some(ref mut maker) = self.maker {
                 // Approximate max fee for maker tracking purposes
                 let active_fee_rate = if self.cached_fee_rate_bps > 0 { self.config.clob_fee_rate } else { 0.0 };
@@ -744,6 +749,9 @@ impl MarketMonitor {
         let size = self.calculate_size(&yes_book, &no_book, yes_ask, no_ask).await;
         if size < 1.0 {
             self.checks_skipped_size = self.checks_skipped_size.saturating_add(1);
+            self.log_action_fast(
+                "🧾 ORDER SEND: NO — computed tradable size is below minimum after liquidity/balance constraints.",
+            );
             self.request_render();
             return;
         }
@@ -761,6 +769,10 @@ impl MarketMonitor {
 
         if expected_profit < self.config.min_net_profit_usd {
             self.checks_skipped_profit = self.checks_skipped_profit.saturating_add(1);
+            self.log_action_fast(&format!(
+                "🧾 ORDER SEND: NO — expected net profit ${expected_profit:.3} is below threshold ${:.3}.",
+                self.config.min_net_profit_usd
+            ));
             self.request_render();
             return;
         }
@@ -840,12 +852,20 @@ impl MarketMonitor {
         let mut size = self.config.max_trade_size;
 
         if max_liq < size {
-            self.log_action_fast(&format!("⚠️ Liquidity limited: {:.1} < {size}", max_liq));
+            self.log_action_fast(&format!(
+                "⚠️ Liquidity limit: only {:.1} shares available at top of book (requested {:.1}).",
+                max_liq, size
+            ));
             size = max_liq;
         }
 
         if balance_size < size {
-            self.log_action_fast(&format!("⚠️ Balance limited size to: {:.1}", balance_size));
+            let requested_before_balance = size;
+            let pair_cost = yes_ask + no_ask;
+            self.log_action_fast(&format!(
+                "⚠️ Balance limit: wallet ${balance:.2} can fund up to {:.1} paired shares at ${pair_cost:.3}/share (requested {:.1} -> capped to {:.1}).",
+                balance_size, requested_before_balance, balance_size
+            ));
             size = balance_size;
         }
 
@@ -906,8 +926,15 @@ impl MarketMonitor {
             "🎯 Size: {} ({}x{}) | UP@{} DOWN@{}",
             total_size, batches, batch_size, opp.yes_price, opp.no_price
         ));
+        self.log_action_fast(&format!(
+            "🧾 ORDER SEND: YES — submitting {} batch(es) now.",
+            batches
+        ));
 
         if self.config.shadow_engine_enabled && !self.config.shadow_engine_send_orders {
+            self.log_action_fast(
+                "🧾 ORDER SEND: NO — shadow mode active (`SHADOW_ENGINE_SEND_ORDERS=false`).",
+            );
             self.log_action_fast("🕶️ Shadow engine active: execution modeled, order send disabled.");
             return;
         }
@@ -974,6 +1001,12 @@ impl MarketMonitor {
                 ));
             }
         }
+        self.log_action_fast(&format!(
+            "🧾 ORDER SEND RESULT: attempted {} batch(es), successful {}, failed {}.",
+            batches,
+            batches.saturating_sub(failed_batches),
+            failed_batches
+        ));
 
         if any_success {
             self.daily_pnl += total_profit;

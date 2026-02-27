@@ -4,13 +4,16 @@ A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScr
 
 ## Features
 
-- **WS-driven arbitrage detection** — event-based strategy loop (20ms throttle) with REST fallback heartbeat
-- **GTC batched execution** — signs both legs concurrently, posts atomically, polls for fills
+- **WS-driven arbitrage detection** — event-based strategy loop with adaptive triggering and REST fallback heartbeat
+- **Event-driven fill tracking** — User WS events are primary for fills with stale-poll fallback
+- **GTC batched execution** — signs both legs concurrently and submits paired legs with harder-to-fill-first ordering
 - **Partial-fill recovery** — smart hedge-or-sell-back when only one leg fills
 - **WebSocket orderbook feed** — real-time updates from Polymarket's WS API with REST fallback
 - **Maker mode** — optional GTC limit orders posted below best ask instead of FOK taker orders
 - **Dynamic fee calculation** — `fee = CLOB_FEE_RATE × (price × (1 − price))^CLOB_FEE_EXPONENT`
 - **Background maintenance workers** — balance (2s), claim polling (5s), and gas cache refresh (30s) off the WS hot path
+- **Merge reconciliation worker** — periodic reserved-state reconciliation for merge confirmations/failures
+- **Shadow rollout controls** — can run decisioning live while disabling actual order submission
 - **Gas-aware profitability** — uses cached gas/POL pricing in strategy hot path
 - **Circuit breaker** — pauses trading after N consecutive failures or daily loss limit
 - **Position tracking** — recovers open YES/NO positions from trade history across restarts
@@ -66,7 +69,25 @@ Key parameters:
 | `MOCK_CURRENCY` | `false` | Paper trading mode (no real orders) |
 | `WS_ENABLED` | `true` | Enable WebSocket feed |
 | `MAKER_MODE_ENABLED` | `false` | Use GTC limit orders instead of FOK |
+| `WS_FILL_PRIMARY` | `true` | Use User WS stream as primary fill source |
+| `WS_FILL_FALLBACK_POLL_MS` | `300` | Poll fallback interval when WS fill stream is stale |
+| `ADAPTIVE_THROTTLE_MIN_MS` | `0` | Minimum trigger interval for actionable deltas |
+| `ADAPTIVE_THROTTLE_BURST_DEBOUNCE_MS` | `8` | Debounce interval for noisy WS bursts |
+| `ACTIONABLE_DELTA_MIN_TICKS` | `1` | Tick movement threshold treated as actionable |
+| `SHADOW_ENGINE_ENABLED` | `true` | Enable shadow-mode execution path |
+| `SHADOW_ENGINE_SEND_ORDERS` | `false` | If `false`, model decisions but do not send orders |
+| `MERGE_RECONCILE_INTERVAL_SECS` | `5` | Merge reconciliation cadence |
 | `MAX_DAILY_LOSS_USD` | `10.0` | Daily loss circuit breaker |
+
+### Live Trading vs Shadow Mode
+
+- `MOCK_CURRENCY=false` controls paper-trading vs real wallet mode.
+- `SHADOW_ENGINE_ENABLED=true` and `SHADOW_ENGINE_SEND_ORDERS=false` means:
+  - the bot still detects opportunities and computes execution,
+  - but it does **not** submit real orders.
+- For live order submission with the new engine:
+  - set `SHADOW_ENGINE_SEND_ORDERS=true` (you may keep `SHADOW_ENGINE_ENABLED=true`),
+  - restart the bot.
 
 ## Architecture
 
@@ -105,13 +126,14 @@ Quick view:
 flowchart LR
     WS["Polymarket WS (Market/User)"] --> MC["ws_client.rs"]
     MC --> N["Notify"]
-    N --> S["Strategy loop (check_opportunity)"]
+    N --> S["Strategy loop (adaptive check_opportunity)"]
     S --> D["Dashboard (ticks/actions)"]
     S --> O["Order execution path"]
     O --> C["CLOB REST + on-chain tx"]
 
     B["Balance worker (2s)"] --> C
     G["Gas worker (30s)"] --> C
+    M["Merge reconcile worker (config)"] --> C
     R["Claim worker (5s)"] --> P["Data API positions(redeemable=true)"]
     R --> C
     R --> D
