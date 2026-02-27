@@ -38,8 +38,8 @@ pub struct DashboardState<'a> {
 
     // PnL
     pub session_start_balance: f64,
-    pub daily_successes: u64,
-    pub consecutive_failures: u32,
+    pub session_successes: u64,
+    pub session_failures: u64,
 
     // Circuit breaker
     pub circuit_breaker_active: bool,
@@ -247,8 +247,8 @@ impl Dashboard {
             };
             let reset = "\x1b[0m";
             out.push_str(&format!(
-                "   Daily PnL: {color}{sign}${pnl:.3} ({sign}{pnl_pct:.1}%){reset} | Successes: {} | Failures: {}\n",
-                state.daily_successes, state.consecutive_failures
+                "   Daily PnL: {color}{sign}${pnl:.3} ({sign}{pnl_pct:.1}%){reset} | Session Successes: {} | Session Failures: {}\n",
+                state.session_successes, state.session_failures
             ));
         }
 

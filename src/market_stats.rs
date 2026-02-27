@@ -22,6 +22,11 @@ impl MarketStatsTracker {
         self.stats.successes
     }
 
+    /// Number of failed executions.
+    pub fn failures(&self) -> u64 {
+        self.stats.failures
+    }
+
     pub async fn load() -> Result<Self> {
         let path = PathBuf::from("logs/market_stats.json");
         if let Some(parent) = path.parent() {
@@ -73,6 +78,10 @@ impl MarketStatsTracker {
 
     pub fn record_sellback(&mut self) {
         self.stats.sold_back += 1;
+    }
+
+    pub fn record_failure(&mut self) {
+        self.stats.failures += 1;
     }
 
     /// Flush stats to disk (called on market rollover or graceful shutdown).

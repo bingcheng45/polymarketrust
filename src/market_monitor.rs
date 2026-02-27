@@ -75,6 +75,8 @@ pub struct MarketMonitor {
     position: Position,
     session_locked_value: f64,
     session_start_balance: f64,
+    session_successes_baseline: u64,
+    session_failures_baseline: u64,
 
     // Circuit breaker
     daily_pnl: f64,
@@ -136,6 +138,8 @@ impl MarketMonitor {
     pub async fn new(config: Arc<Config>, client: Arc<ClobClient>) -> Result<Self> {
         let trade_logger = TradeLogger::new().await?;
         let stats = MarketStatsTracker::load().await?;
+        let session_successes_baseline = stats.successes();
+        let session_failures_baseline = stats.failures();
         let maker = if config.maker_mode_enabled {
             Some(MakerStrategy::new(Arc::clone(&config)))
         } else {
@@ -156,6 +160,8 @@ impl MarketMonitor {
             position: Position::default(),
             session_locked_value: 0.0,
             session_start_balance: 0.0,
+            session_successes_baseline,
+            session_failures_baseline,
             daily_pnl: 0.0,
             consecutive_failures: 0,
             circuit_breaker_until: None,
@@ -789,6 +795,7 @@ impl MarketMonitor {
                     }
                     failed_batches += 1;
                     self.consecutive_failures += 1;
+                    self.stats.record_failure();
 
                     if self.consecutive_failures >= self.config.max_consecutive_failures {
                         let cooldown = Duration::from_millis(self.config.circuit_breaker_cooldown_ms);
@@ -1911,6 +1918,18 @@ impl MarketMonitor {
         yes_filled >= target_fill && no_filled >= target_fill
     }
 
+    fn session_successes(&self) -> u64 {
+        self.stats
+            .successes()
+            .saturating_sub(self.session_successes_baseline)
+    }
+
+    fn session_failures(&self) -> u64 {
+        self.stats
+            .failures()
+            .saturating_sub(self.session_failures_baseline)
+    }
+
     fn batch_order_size(batch_idx: usize, total_batches: usize, total_size: f64, batch_size: f64) -> f64 {
         if total_batches == 0 {
             return 0.0;
@@ -2173,8 +2192,8 @@ impl MarketMonitor {
             outcome_yes_label: "Up",
             outcome_no_label: "Down",
             session_start_balance: self.session_start_balance,
-            daily_successes: self.stats.successes(),
-            consecutive_failures: self.consecutive_failures,
+            session_successes: self.session_successes(),
+            session_failures: self.session_failures(),
             circuit_breaker_active: cb_active,
             circuit_breaker_remaining_secs: cb_remaining,
             data_source: &self.last_data_source,
@@ -2259,6 +2278,8 @@ mod tests {
             position: Position::default(),
             session_locked_value: 0.0,
             session_start_balance: 1000.0, // Mock balance
+            session_successes_baseline: 0,
+            session_failures_baseline: 0,
             daily_pnl: 0.0,
             consecutive_failures: 0,
             circuit_breaker_until: None,
@@ -2454,5 +2475,25 @@ mod tests {
         let b2 = MarketMonitor::batch_order_size(1, 2, 12.0, 6.0);
         assert_eq!(b1, 6.0);
         assert_eq!(b2, 6.0);
+    }
+
+    #[tokio::test]
+    async fn test_session_successes_uses_startup_baseline() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.session_successes_baseline = 5;
+        monitor.stats.stats.successes = 8;
+        assert_eq!(monitor.session_successes(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_session_failures_uses_startup_baseline() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.session_failures_baseline = 2;
+        monitor.stats.stats.failures = 7;
+        assert_eq!(monitor.session_failures(), 5);
     }
 }
