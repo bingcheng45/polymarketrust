@@ -18,7 +18,8 @@ use crate::maker_strategy::MakerStrategy;
 use crate::market_stats::MarketStatsTracker;
 use crate::trade_logger::TradeLogger;
 use crate::types::{
-    ArbOpportunity, GasCache, MarketInfo, OrderBook, Position, Side, TimeInForce,
+    ArbOpportunity, ExecutionBatchState, ExecutionState, GasCache, MarketInfo, OrderBook,
+    OrderLegState, PendingMergeState, PendingMergeStatus, Position, Side, TimeInForce,
 };
 use crate::ws_client::WsClient;
 use anyhow::{Context, Result};
@@ -28,7 +29,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, info, warn};
 
 
@@ -57,6 +58,25 @@ const WS_STALE_GRACE_SECS: u64 = 10;
 struct PostedOrderIds {
     yes_order_id: String,
     no_order_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActionableBookSnapshot {
+    yes_ask: f64,
+    no_ask: f64,
+    yes_size: f64,
+    no_size: f64,
+}
+
+#[derive(Debug, Clone)]
+struct MergeResultMsg {
+    merge_id: String,
+    condition_id: String,
+    question: String,
+    size: f64,
+    tx_hash: Option<String>,
+    success: bool,
+    error: Option<String>,
 }
 
 pub struct MarketMonitor {
@@ -111,6 +131,19 @@ pub struct MarketMonitor {
     is_redeeming: Arc<AtomicBool>,
     pending_claim_value: f64,
 
+    // Event-driven execution tracking
+    order_tracker: HashMap<String, OrderLegState>,
+    order_to_batch: HashMap<String, String>,
+    execution_batches: HashMap<String, ExecutionBatchState>,
+    ws_fill_last_event_at: Option<Instant>,
+    last_actionable_snapshot: Option<ActionableBookSnapshot>,
+
+    // Merge reconciliation state
+    pending_merges: HashMap<String, PendingMergeState>,
+    pending_merge_reserved_size: f64,
+    merge_result_tx: mpsc::UnboundedSender<MergeResultMsg>,
+    merge_result_rx: mpsc::UnboundedReceiver<MergeResultMsg>,
+
     // TUI dashboard
     dashboard: Dashboard,
     last_balance: Option<f64>,
@@ -128,6 +161,9 @@ pub struct MarketMonitor {
     claim_retry_after: HashMap<String, Instant>,
     claim_success_suppression_until: HashMap<String, Instant>,
     check_latency_ms: VecDeque<u64>,
+    detect_to_submit_latency_ms: VecDeque<u64>,
+    first_fill_latency_ms: VecDeque<u64>,
+    pair_complete_latency_ms: VecDeque<u64>,
     claim_latency_ms: VecDeque<u64>,
     balance_latency_ms: VecDeque<u64>,
     lock_wait_latency_ms: VecDeque<u64>,
@@ -138,6 +174,12 @@ pub struct MarketMonitor {
     checks_skipped_size: u64,
     checks_skipped_profit: u64,
     checks_executed: u64,
+    opportunity_detected_count: u64,
+    post_attempt_count: u64,
+    post_paired_count: u64,
+    hedge_event_count: u64,
+    stale_poll_fallback_count: u64,
+    merge_mismatch_count: u64,
     perf_last_log: Instant,
     render_requested: bool,
 }
@@ -153,6 +195,7 @@ impl MarketMonitor {
         } else {
             None
         };
+        let (merge_result_tx, merge_result_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             config,
@@ -186,6 +229,15 @@ impl MarketMonitor {
             errors: Vec::new(),
             is_redeeming: Arc::new(AtomicBool::new(false)),
             pending_claim_value: 0.0,
+            order_tracker: HashMap::new(),
+            order_to_batch: HashMap::new(),
+            execution_batches: HashMap::new(),
+            ws_fill_last_event_at: None,
+            last_actionable_snapshot: None,
+            pending_merges: HashMap::new(),
+            pending_merge_reserved_size: 0.0,
+            merge_result_tx,
+            merge_result_rx,
             dashboard: Dashboard::new(),
             last_balance: None,
             last_balance_refresh: Instant::now(),
@@ -201,6 +253,9 @@ impl MarketMonitor {
             claim_retry_after: HashMap::new(),
             claim_success_suppression_until: HashMap::new(),
             check_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
+            detect_to_submit_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
+            first_fill_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
+            pair_complete_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
             claim_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
             balance_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
             lock_wait_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
@@ -211,6 +266,12 @@ impl MarketMonitor {
             checks_skipped_size: 0,
             checks_skipped_profit: 0,
             checks_executed: 0,
+            opportunity_detected_count: 0,
+            post_attempt_count: 0,
+            post_paired_count: 0,
+            hedge_event_count: 0,
+            stale_poll_fallback_count: 0,
+            merge_mismatch_count: 0,
             perf_last_log: Instant::now(),
             render_requested: true,
         })
@@ -234,10 +295,7 @@ impl MarketMonitor {
         self.session_start_balance = balance;
         self.last_balance = Some(balance);
 
-        // 2. Load prior trade history to recover open positions
-        self.recover_positions_from_trades().await;
-
-        // 3. Init session logger
+        // 2. Init session logger
         let market_slug = self.config.market_slugs.join(",");
         let logger = SessionLogger::new(
             &self.config.private_key,
@@ -250,7 +308,7 @@ impl MarketMonitor {
         .await?;
         self.session_logger = Some(logger);
 
-        // 4. Find active market (retry forever until one appears)
+        // 3. Find active market (retry forever until one appears)
         loop {
             self.last_market_discovery_attempt = Some(Instant::now());
             match self.find_active_market().await {
@@ -273,6 +331,9 @@ impl MarketMonitor {
             }
             tokio::time::sleep(Duration::from_secs(MARKET_DISCOVERY_RETRY_SECS)).await;
         }
+
+        // 4. Recover prior trade history now that market_info is known.
+        self.recover_positions_from_trades().await;
 
         // 5. Connect WebSocket if enabled
         self.connect_ws_for_active_market(false).await;
@@ -465,10 +526,69 @@ impl MarketMonitor {
         self.ws_client.is_some()
     }
 
+    /// Adaptive trigger gate for WS notifications.
+    /// Actionable deltas run at min interval; noisy bursts are debounced.
+    pub async fn should_run_on_ws_notify(&mut self) -> bool {
+        let actionable = self.consume_ws_actionable_signal().await;
+        let since_last = self
+            .last_check
+            .map(|t| t.elapsed())
+            .unwrap_or_else(|| Duration::from_secs(3600));
+        let threshold_ms = if actionable {
+            self.config.adaptive_throttle_min_ms
+        } else {
+            self.config.adaptive_throttle_burst_debounce_ms
+        };
+        since_last >= Duration::from_millis(threshold_ms)
+    }
+
+    async fn consume_ws_actionable_signal(&mut self) -> bool {
+        let Some(mi) = self.market_info.as_ref() else {
+            return true;
+        };
+        let Some(ws) = self.ws_client.as_ref() else {
+            return true;
+        };
+        let (yes_book_opt, no_book_opt) = tokio::join!(
+            ws.get_order_book(&mi.tokens.yes),
+            ws.get_order_book(&mi.tokens.no)
+        );
+        let (Some(yes_book), Some(no_book)) = (yes_book_opt, no_book_opt) else {
+            return true;
+        };
+        let (Some(yes_ask), Some(no_ask)) = (yes_book.best_ask(), no_book.best_ask()) else {
+            return true;
+        };
+        let yes_size = yes_book.best_ask_size();
+        let no_size = no_book.best_ask_size();
+        let snap = ActionableBookSnapshot {
+            yes_ask,
+            no_ask,
+            yes_size,
+            no_size,
+        };
+
+        let actionable = if let Some(prev) = self.last_actionable_snapshot.as_ref() {
+            let tick = mi.tick_size.max(0.0001);
+            let min_tick_move = self.config.actionable_delta_min_ticks as f64 * tick;
+            let size_threshold = (self.config.min_liquidity_size * 0.25).max(1.0);
+            (yes_ask - prev.yes_ask).abs() >= min_tick_move
+                || (no_ask - prev.no_ask).abs() >= min_tick_move
+                || (yes_size - prev.yes_size).abs() >= size_threshold
+                || (no_size - prev.no_size).abs() >= size_threshold
+        } else {
+            true
+        };
+
+        self.last_actionable_snapshot = Some(snap);
+        actionable
+    }
+
     pub async fn check_opportunity(&mut self) {
         // Note: rate-limiting is now controlled by the caller (main.rs)
         // via WS-driven 20ms throttle + 1s REST fallback.
         self.last_check = Some(Instant::now());
+        self.process_merge_results().await;
 
         // Process any incoming User WS events
         self.process_user_events().await;
@@ -575,9 +695,9 @@ impl MarketMonitor {
         }
 
         // Trigger merge if we have a balanced position
-        if self.position.mergeable_amount() >= 1.0 {
+        if self.mergeable_available() >= 1.0 {
             if self.last_merge_attempt.map(|t| t.elapsed().as_secs() >= MERGE_RETRY_SECS).unwrap_or(true) {
-                let amount = self.position.mergeable_amount();
+                let amount = self.mergeable_available();
                 self.fire_merge(amount, &mi).await;
             }
             // Do NOT return here! The bot can continue hunting for new arbs with remaining capital!
@@ -599,6 +719,7 @@ impl MarketMonitor {
 
             // Record opportunity for stats
             self.stats.record_opportunity(net_spread);
+            self.opportunity_detected_count = self.opportunity_detected_count.saturating_add(1);
 
             let arb_msg = format!("🚨 ARB OPPORTUNITY! Cost: {:.2}", total_cost);
             self.log_action(&arb_msg).await;
@@ -654,7 +775,8 @@ impl MarketMonitor {
         };
 
         self.checks_executed = self.checks_executed.saturating_add(1);
-        self.execute_arb(opportunity, &mi, size).await;
+        let detect_ts = Utc::now();
+        self.execute_arb(opportunity, &mi, size, detect_ts).await;
 
         self.request_render();
     }
@@ -756,7 +878,13 @@ impl MarketMonitor {
 
     // ─── Arbitrage Execution ───────────────────────────────────────────────────
 
-    async fn execute_arb(&mut self, opp: ArbOpportunity, mi: &MarketInfo, total_size: f64) {
+    async fn execute_arb(
+        &mut self,
+        opp: ArbOpportunity,
+        mi: &MarketInfo,
+        total_size: f64,
+        detect_ts: chrono::DateTime<Utc>,
+    ) {
         let active_fee_rate = if self.cached_fee_rate_bps > 0 { self.config.clob_fee_rate } else { 0.0 };
         let fee_yes = active_fee_rate * (opp.yes_price * (1.0 - opp.yes_price)).powf(self.config.clob_fee_exponent);
         let fee_no = active_fee_rate * (opp.no_price * (1.0 - opp.no_price)).powf(self.config.clob_fee_exponent);
@@ -779,6 +907,11 @@ impl MarketMonitor {
             total_size, batches, batch_size, opp.yes_price, opp.no_price
         ));
 
+        if self.config.shadow_engine_enabled && !self.config.shadow_engine_send_orders {
+            self.log_action_fast("🕶️ Shadow engine active: execution modeled, order send disabled.");
+            return;
+        }
+
         let mut total_profit = 0.0_f64;
         let mut any_success = false;
         let mut failed_batches = 0;
@@ -789,17 +922,16 @@ impl MarketMonitor {
                 continue;
             }
 
-            let cheap_str = if opp.yes_price <= opp.no_price {
-                format!("UP@{} (cheap first) + DOWN@{}", opp.yes_price, opp.no_price)
-            } else {
-                format!("DOWN@{} (cheap first) + UP@{}", opp.no_price, opp.yes_price)
-            };
             self.log_action_fast(&format!(
-                "📤 Batch {}/{}: GTC {} | {} shares",
-                batch + 1, batches, cheap_str, this_size
+                "📤 Batch {}/{}: GTC pair submit (harder-fill-first policy) | {} shares",
+                batch + 1, batches, this_size
             ));
 
-            match self.execute_batch(&opp, mi, this_size).await {
+            let batch_id = format!("{}:{}:{}", mi.condition_id, Utc::now().timestamp_millis(), batch);
+            match self
+                .execute_batch(&opp, mi, this_size, detect_ts, batch_id.clone())
+                .await
+            {
                 Ok(profit) => {
                     total_profit += profit;
                     any_success = true;
@@ -860,6 +992,8 @@ impl MarketMonitor {
         opp: &ArbOpportunity,
         mi: &MarketInfo,
         size: f64,
+        detect_ts: chrono::DateTime<Utc>,
+        batch_id: String,
     ) -> Result<f64> {
         // Apply dynamic fee adjustment per leg
         let actual_size_yes = self.fee_adjust_shares(size, opp.yes_price);
@@ -879,6 +1013,7 @@ impl MarketMonitor {
         }
 
         // Sign both legs concurrently (bounded by SDK timeout)
+        let sign_start_ts = Utc::now();
         let (yes_result, no_result) = tokio::join!(
             self.run_sdk_call(
                 "sign YES order",
@@ -905,33 +1040,64 @@ impl MarketMonitor {
                 )
             )
         );
+        let sign_end_ts = Utc::now();
 
         let yes_order = yes_result?;
         let no_order = no_result?;
 
-        // Post cheaper leg first (less liquid = higher network priority)
-        let (first, second) = if opp.yes_price <= opp.no_price {
+        // Post harder-to-fill leg first using local fillability score from visible depth.
+        let mut yes_fillability = f64::INFINITY;
+        let mut no_fillability = f64::INFINITY;
+        if let Some((yes_book, no_book)) = self.fetch_books(mi).await {
+            yes_fillability = yes_book.ask_liquidity_at(opp.yes_price);
+            no_fillability = no_book.ask_liquidity_at(opp.no_price);
+        }
+        let yes_posted_first = if yes_fillability.is_finite() && no_fillability.is_finite() {
+            yes_fillability <= no_fillability
+        } else {
+            opp.yes_price >= opp.no_price
+        };
+        let (first, second) = if yes_posted_first {
             (yes_order, no_order)
         } else {
             (no_order, yes_order)
         };
 
         // Post both as GTC batch (bounded by SDK timeout)
+        let post_start_ts = Utc::now();
         let responses = self
             .run_sdk_call("post GTC batch", self.client.post_orders(vec![first, second], "GTC"))
             .await?;
+        let post_end_ts = Utc::now();
+        self.post_attempt_count = self.post_attempt_count.saturating_add(1);
 
         if responses.is_empty() {
             anyhow::bail!("No responses from post_orders");
         }
+        let posted_ids = Self::map_posted_order_ids(yes_posted_first, &responses);
+        self.register_posted_batch(
+            &batch_id,
+            mi,
+            size,
+            detect_ts,
+            sign_start_ts,
+            sign_end_ts,
+            post_start_ts,
+            post_end_ts,
+            &posted_ids,
+            opp,
+        );
+        let detect_to_submit_ms = (post_end_ts - detect_ts).num_milliseconds().max(0) as u64;
+        Self::push_latency_value(&mut self.detect_to_submit_latency_ms, detect_to_submit_ms);
 
         // Wait for fills
         let timeout_ms = self
             .config
             .gtc_taker_timeout_ms
             .min(Self::env_u64("ORDER_STATUS_TIMEOUT_MS", ORDER_STATUS_TIMEOUT_MS));
-        let posted_ids = Self::map_posted_order_ids(opp.yes_price <= opp.no_price, &responses);
-        let (yes_filled, no_filled) = self.poll_fills(&posted_ids, size, timeout_ms).await;
+        let (yes_filled, no_filled) = self
+            .wait_for_fills_event_driven(&posted_ids, size, timeout_ms, &batch_id)
+            .await;
 
         // Cancel any remaining open orders
         for resp in &responses {
@@ -951,6 +1117,7 @@ impl MarketMonitor {
         let cost = yes_filled * opp.yes_price + no_filled * opp.no_price;
 
         if yes_filled >= size * 0.95 && no_filled >= size * 0.95 {
+            self.post_paired_count = self.post_paired_count.saturating_add(1);
             // Both legs filled — merge
             let mergeable = actual_payout_size.min(yes_filled).min(no_filled);
             self.position.yes_size += yes_filled;
@@ -961,8 +1128,12 @@ impl MarketMonitor {
             self.active_assets.insert(mi.tokens.no.clone());
 
             // Fire merge in background
-            let fire_merge_amount = self.position.mergeable_amount();
+            let fire_merge_amount = self.mergeable_available();
             self.fire_merge(fire_merge_amount, mi).await;
+            if let Some(batch) = self.execution_batches.get_mut(&batch_id) {
+                batch.state = ExecutionState::MergePending;
+                batch.realized_pnl_usd = Some(mergeable * 1.0 - cost - self.gas_cache.fee_per_merge_usd);
+            }
 
             let profit = mergeable * 1.0 - cost - self.gas_cache.fee_per_merge_usd;
             self.trade_logger
@@ -992,81 +1163,220 @@ impl MarketMonitor {
                 "📦 Exit estimate: ${expected_payout:.2} payout (merge) | gross ${gross_profit:+.2} | net ${profit:+.2} ({roi_pct:+.2}%)"
             ))
             .await;
+            if let Some(batch) = self.execution_batches.get_mut(&batch_id) {
+                batch.state = ExecutionState::Closed;
+            }
 
             Ok(profit)
         } else if yes_filled > 0.05 || no_filled > 0.05 {
             // Partial fill — hedge the missing leg
+            self.hedge_event_count = self.hedge_event_count.saturating_add(1);
+            if let Some(batch) = self.execution_batches.get_mut(&batch_id) {
+                batch.state = ExecutionState::HedgePending;
+            }
             self.handle_partial_fill(
                 yes_filled, no_filled, opp, mi, self.cached_fee_rate_bps, cost,
             )
             .await
         } else {
+            if let Some(batch) = self.execution_batches.get_mut(&batch_id) {
+                batch.state = ExecutionState::Failed;
+            }
             anyhow::bail!("Both legs missed (yes={yes_filled:.2} no={no_filled:.2})")
         }
     }
 
-    /// Poll for GTC fill status until timeout.
-    async fn poll_fills(
-        &self,
+    /// Event-driven fill wait: User WS events primary, REST polling fallback on staleness.
+    async fn wait_for_fills_event_driven(
+        &mut self,
         posted_ids: &PostedOrderIds,
         target_size: f64,
         timeout_ms: u64,
+        batch_id: &str,
     ) -> (f64, f64) {
         let start = Instant::now();
+        let poll_interval_ms = self.config.ws_fill_fallback_poll_ms.max(50);
+        let mut last_fallback_poll =
+            Instant::now() - Duration::from_millis(self.config.ws_fill_fallback_poll_ms.max(1));
         let mut yes_filled = 0.0_f64;
         let mut no_filled = 0.0_f64;
-        let order_lookup_timeout_ms = Self::env_u64("SDK_CALL_TIMEOUT_MS", SDK_CALL_TIMEOUT_MS);
-        let order_lookup_timeout = Duration::from_millis(order_lookup_timeout_ms);
+
         while start.elapsed().as_millis() < timeout_ms as u128 {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.process_user_events().await;
 
-            let yes_future = async {
-                if !posted_ids.yes_order_id.is_empty() {
-                    if let Ok(Some(ord)) = tokio::time::timeout(
-                        order_lookup_timeout,
-                        self.client.get_order(&posted_ids.yes_order_id),
-                    )
-                    .await
-                    .context("YES order lookup timed out")
-                    .and_then(|res| res.context("YES order lookup failed"))
-                    {
-                        return Some(ord.matched_f64());
-                    }
-                }
-                None
-            };
-
-            let no_future = async {
-                if !posted_ids.no_order_id.is_empty() {
-                    if let Ok(Some(ord)) = tokio::time::timeout(
-                        order_lookup_timeout,
-                        self.client.get_order(&posted_ids.no_order_id),
-                    )
-                    .await
-                    .context("NO order lookup timed out")
-                    .and_then(|res| res.context("NO order lookup failed"))
-                    {
-                        return Some(ord.matched_f64());
-                    }
-                }
-                None
-            };
-
-            let (yes_res, no_res) = tokio::join!(yes_future, no_future);
-
-            if let Some(matched) = yes_res {
-                yes_filled = matched;
+            if let Some(yes_leg) = self.order_tracker.get(&posted_ids.yes_order_id) {
+                yes_filled = yes_leg.matched_size;
             }
-            if let Some(matched) = no_res {
-                no_filled = matched;
+            if let Some(no_leg) = self.order_tracker.get(&posted_ids.no_order_id) {
+                no_filled = no_leg.matched_size;
+            }
+
+            let ws_stale = self
+                .ws_fill_last_event_at
+                .map(|t| t.elapsed() > Duration::from_millis(self.config.ws_fill_fallback_poll_ms))
+                .unwrap_or(true);
+            if (!self.config.ws_fill_primary || ws_stale)
+                && last_fallback_poll.elapsed() >= Duration::from_millis(poll_interval_ms)
+            {
+                self.stale_poll_fallback_count = self.stale_poll_fallback_count.saturating_add(1);
+                let (yes_polled, no_polled) = self.poll_fills_once(posted_ids).await;
+                if let Some(v) = yes_polled {
+                    self.update_order_fill_state(&posted_ids.yes_order_id, v, Utc::now(), false);
+                    yes_filled = yes_filled.max(v);
+                }
+                if let Some(v) = no_polled {
+                    self.update_order_fill_state(&posted_ids.no_order_id, v, Utc::now(), false);
+                    no_filled = no_filled.max(v);
+                }
+                last_fallback_poll = Instant::now();
             }
 
             if Self::fills_sufficient(yes_filled, no_filled, target_size) {
+                if let Some(batch) = self.execution_batches.get_mut(batch_id) {
+                    batch.state = ExecutionState::Paired;
+                    let now = Utc::now();
+                    batch.paired_complete_ts = Some(now);
+                    if let Some(first_fill_ts) = batch.first_fill_event_ts {
+                        let first_fill_ms = (first_fill_ts - batch.detect_ts).num_milliseconds().max(0) as u64;
+                        Self::push_latency_value(&mut self.first_fill_latency_ms, first_fill_ms);
+                    }
+                    let pair_ms = (now - batch.detect_ts).num_milliseconds().max(0) as u64;
+                    Self::push_latency_value(&mut self.pair_complete_latency_ms, pair_ms);
+                }
                 break;
             }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         (yes_filled, no_filled)
+    }
+
+    async fn poll_fills_once(&self, posted_ids: &PostedOrderIds) -> (Option<f64>, Option<f64>) {
+        let order_lookup_timeout_ms = Self::env_u64("SDK_CALL_TIMEOUT_MS", SDK_CALL_TIMEOUT_MS);
+        let order_lookup_timeout = Duration::from_millis(order_lookup_timeout_ms);
+        let yes_future = async {
+            if posted_ids.yes_order_id.is_empty() {
+                return None;
+            }
+            tokio::time::timeout(order_lookup_timeout, self.client.get_order(&posted_ids.yes_order_id))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .and_then(|o| o.map(|x| x.matched_f64()))
+        };
+        let no_future = async {
+            if posted_ids.no_order_id.is_empty() {
+                return None;
+            }
+            tokio::time::timeout(order_lookup_timeout, self.client.get_order(&posted_ids.no_order_id))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .and_then(|o| o.map(|x| x.matched_f64()))
+        };
+        tokio::join!(yes_future, no_future)
+    }
+
+    fn register_posted_batch(
+        &mut self,
+        batch_id: &str,
+        mi: &MarketInfo,
+        size: f64,
+        detect_ts: chrono::DateTime<Utc>,
+        sign_start_ts: chrono::DateTime<Utc>,
+        sign_end_ts: chrono::DateTime<Utc>,
+        post_start_ts: chrono::DateTime<Utc>,
+        post_end_ts: chrono::DateTime<Utc>,
+        posted_ids: &PostedOrderIds,
+        opp: &ArbOpportunity,
+    ) {
+        let now = Utc::now();
+        let yes_leg = OrderLegState {
+            token_id: mi.tokens.yes.clone(),
+            order_id: posted_ids.yes_order_id.clone(),
+            target_size: size,
+            matched_size: 0.0,
+            last_update_ts: now,
+        };
+        let no_leg = OrderLegState {
+            token_id: mi.tokens.no.clone(),
+            order_id: posted_ids.no_order_id.clone(),
+            target_size: size,
+            matched_size: 0.0,
+            last_update_ts: now,
+        };
+        if !posted_ids.yes_order_id.is_empty() {
+            self.order_tracker
+                .insert(posted_ids.yes_order_id.clone(), yes_leg.clone());
+            self.order_to_batch
+                .insert(posted_ids.yes_order_id.clone(), batch_id.to_string());
+        }
+        if !posted_ids.no_order_id.is_empty() {
+            self.order_tracker
+                .insert(posted_ids.no_order_id.clone(), no_leg.clone());
+            self.order_to_batch
+                .insert(posted_ids.no_order_id.clone(), batch_id.to_string());
+        }
+
+        self.execution_batches.insert(
+            batch_id.to_string(),
+            ExecutionBatchState {
+                batch_id: batch_id.to_string(),
+                condition_id: mi.condition_id.clone(),
+                state: ExecutionState::Posted,
+                yes_leg,
+                no_leg,
+                detect_ts,
+                sign_start_ts: Some(sign_start_ts),
+                sign_end_ts: Some(sign_end_ts),
+                post_start_ts: Some(post_start_ts),
+                post_end_ts: Some(post_end_ts),
+                first_fill_event_ts: None,
+                paired_complete_ts: None,
+                expected_pnl_usd: Some(size - (opp.total_cost * size) - self.gas_cache.fee_per_merge_usd),
+                realized_pnl_usd: None,
+            },
+        );
+    }
+
+    fn update_order_fill_state(
+        &mut self,
+        order_id: &str,
+        matched: f64,
+        now: chrono::DateTime<Utc>,
+        from_ws: bool,
+    ) {
+        if let Some(leg) = self.order_tracker.get_mut(order_id) {
+            if matched >= leg.matched_size {
+                leg.matched_size = matched;
+                leg.last_update_ts = now;
+            }
+        }
+        let Some(batch_id) = self.order_to_batch.get(order_id).cloned() else {
+            return;
+        };
+        if let Some(batch) = self.execution_batches.get_mut(&batch_id) {
+            if batch.yes_leg.order_id == order_id {
+                batch.yes_leg.matched_size = batch.yes_leg.matched_size.max(matched);
+                batch.yes_leg.last_update_ts = now;
+            }
+            if batch.no_leg.order_id == order_id {
+                batch.no_leg.matched_size = batch.no_leg.matched_size.max(matched);
+                batch.no_leg.last_update_ts = now;
+            }
+            if batch.first_fill_event_ts.is_none()
+                && (batch.yes_leg.matched_size > 0.0 || batch.no_leg.matched_size > 0.0)
+            {
+                batch.first_fill_event_ts = Some(now);
+            }
+            if batch.yes_leg.matched_size > 0.0 || batch.no_leg.matched_size > 0.0 {
+                batch.state = ExecutionState::Partial;
+            }
+        }
+        if from_ws {
+            self.ws_fill_last_event_at = Some(Instant::now());
+        }
     }
 
     // ─── Partial Fill / Hedge Logic ────────────────────────────────────────────
@@ -1126,17 +1436,37 @@ impl MarketMonitor {
         filled_cost: f64,
         filled_is_yes: bool,
     ) -> Result<f64> {
-        // Estimate hedge P&L: buy missing leg and merge
+        // Estimate hedge and sell-back using live depth when available.
+        let mut expected_missing_cost = missing_price * size;
+        let mut expected_sell_proceeds = filled_price * size * 0.95;
+        if let Some((yes_book, no_book)) = self.fetch_books(mi).await {
+            if missing_token_id == mi.tokens.yes {
+                expected_missing_cost = Self::estimate_buy_cost_from_book(&yes_book, size)
+                    .unwrap_or(expected_missing_cost);
+            } else {
+                expected_missing_cost = Self::estimate_buy_cost_from_book(&no_book, size)
+                    .unwrap_or(expected_missing_cost);
+            }
+            if filled_token_id == mi.tokens.yes {
+                expected_sell_proceeds = Self::estimate_sell_proceeds_from_book(&yes_book, size)
+                    .unwrap_or(expected_sell_proceeds);
+            } else {
+                expected_sell_proceeds = Self::estimate_sell_proceeds_from_book(&no_book, size)
+                    .unwrap_or(expected_sell_proceeds);
+            }
+        }
+
+        // Hedge P&L: buy missing leg and merge.
         let actual_size_missing = self.fee_adjust_shares(size, missing_price);
         let actual_size_filled = self.fee_adjust_shares(size, filled_price);
         let mergeable = actual_size_missing.min(actual_size_filled);
-        let hedge_pnl =
-            mergeable * 1.0 - filled_cost - missing_price * size - self.gas_cache.fee_per_merge_usd;
+        let hedge_pnl = mergeable * 1.0
+            - filled_cost
+            - expected_missing_cost
+            - self.gas_cache.fee_per_merge_usd;
 
-        // Estimate sell-back P&L: sell filled leg at current bid
-        // Approximate sell proceeds as filled_price * 0.95 (pessimistic)
-        let sell_proceeds = filled_price * size * 0.95;
-        let sell_pnl = sell_proceeds - filled_cost;
+        // Sell-back P&L from expected executable bid depth.
+        let sell_pnl = expected_sell_proceeds - filled_cost;
 
         let sold_back = sell_pnl >= hedge_pnl;
 
@@ -1206,7 +1536,7 @@ impl MarketMonitor {
                 }
                 self.active_assets.insert(mi.tokens.yes.clone());
                 self.active_assets.insert(mi.tokens.no.clone());
-                let fire_amount = self.position.mergeable_amount();
+                let fire_amount = self.mergeable_available();
                 self.fire_merge(fire_amount, mi).await;
                 self.stats.record_hedge();
             }
@@ -1326,10 +1656,11 @@ impl MarketMonitor {
 
         self.last_merge_attempt = Some(Instant::now());
 
-        // Cap to actual position
-        let capped = amount
-            .min(self.position.yes_size)
-            .min(self.position.no_size);
+        // Cap to currently available (excluding already reserved pending merges).
+        let capped = amount.min(self.mergeable_available());
+        if capped < 0.01 {
+            return;
+        }
 
         // ── Relayer delay guard ───────────────────────────────────────────────
         // Polymarket's fill relayer can take a few seconds to settle CTF tokens
@@ -1358,30 +1689,43 @@ impl MarketMonitor {
             }
         }
 
-        // Reduce in-memory position immediately (optimistic update)
-        self.position.yes_size -= capped;
-        self.position.no_size -= capped;
-        self.session_locked_value += capped; // USDC value locked until merge confirms
-
+        let merge_id = format!("{}:{}:{:.2}", mi.condition_id, Utc::now().timestamp_millis(), capped);
         let condition_id = mi.condition_id.clone();
         let question = mi.question.clone();
         let neg_risk = mi.neg_risk;
+        self.pending_merge_reserved_size += capped;
+        self.session_locked_value += capped; // value reserved until confirmation/failure is processed.
+        self.pending_merges.insert(
+            merge_id.clone(),
+            PendingMergeState {
+                merge_id: merge_id.clone(),
+                condition_id: condition_id.clone(),
+                size: capped,
+                tx_hash: None,
+                status: PendingMergeStatus::Submitted,
+                created_at: Utc::now(),
+            },
+        );
 
         if self.config.mock_currency {
             // Mock mode — just log, no on-chain call
-            info!("[MOCK] Merged {capped:.2} YES+NO → USDC");
-            self.trade_logger
-                .log_merge(&condition_id, Some(&question), capped, true, None)
-                .await;
-            self.session_locked_value -= capped;
+            let msg = MergeResultMsg {
+                merge_id,
+                condition_id,
+                question,
+                size: capped,
+                tx_hash: None,
+                success: true,
+                error: None,
+            };
+            let _ = self.merge_result_tx.send(msg);
             return;
         }
 
         info!("Merging {capped:.2} YES+NO → USDC (on-chain, fire-and-forget)");
 
         let client = Arc::clone(&self.client);
-        let _trade_logger_path = "logs/trades.jsonl".to_string(); // Re-create to avoid borrow
-        let _locked_ref = self.session_locked_value; // snapshot — background task won't mutate shared state
+        let tx = self.merge_result_tx.clone();
 
         tokio::spawn(async move {
             let mut last_err = None;
@@ -1391,16 +1735,16 @@ impl MarketMonitor {
                     .await
                 {
                     Ok(tx_hash) => {
-                        info!(
-                            "Merge confirmed: {:.2} shares → USDC | tx={tx_hash:?}",
-                            capped
-                        );
-                        // Log success
-                        if let Ok(logger) = crate::trade_logger::TradeLogger::new().await {
-                            logger
-                                .log_merge(&condition_id, Some(&question), capped, true, None)
-                                .await;
-                        }
+                        let result = MergeResultMsg {
+                            merge_id,
+                            condition_id,
+                            question,
+                            size: capped,
+                            tx_hash: Some(format!("{tx_hash:?}")),
+                            success: true,
+                            error: None,
+                        };
+                        let _ = tx.send(result);
                         return;
                     }
                     Err(e) => {
@@ -1410,22 +1754,71 @@ impl MarketMonitor {
                 }
             }
 
-            // All RPCs failed
-            if let Some(e) = last_err {
-                warn!("Merge exhausted all RPCs: {e}");
-                if let Ok(logger) = crate::trade_logger::TradeLogger::new().await {
-                    logger
-                        .log_merge(
-                            &condition_id,
-                            Some(&question),
-                            capped,
-                            false,
-                            Some(e.to_string()),
-                        )
-                        .await;
+            let result = MergeResultMsg {
+                merge_id,
+                condition_id,
+                question,
+                size: capped,
+                tx_hash: None,
+                success: false,
+                error: last_err.map(|e| e.to_string()),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    async fn process_merge_results(&mut self) {
+        while let Ok(msg) = self.merge_result_rx.try_recv() {
+            let released_size = self
+                .pending_merges
+                .remove(&msg.merge_id)
+                .map(|p| p.size)
+                .unwrap_or(msg.size);
+            self.pending_merge_reserved_size =
+                (self.pending_merge_reserved_size - released_size).max(0.0);
+            self.session_locked_value = (self.session_locked_value - released_size).max(0.0);
+
+            if msg.success {
+                self.position.yes_size = (self.position.yes_size - released_size).max(0.0);
+                self.position.no_size = (self.position.no_size - released_size).max(0.0);
+                self.log_action(&format!(
+                    "✅ Merge confirmed: {:.2} shares → USDC | tx={}",
+                    released_size,
+                    msg.tx_hash.as_deref().unwrap_or("n/a")
+                ))
+                .await;
+                self.trade_logger
+                    .log_merge(&msg.condition_id, Some(&msg.question), released_size, true, None)
+                    .await;
+                for batch in self.execution_batches.values_mut() {
+                    if batch.condition_id == msg.condition_id && batch.state == ExecutionState::MergePending {
+                        batch.state = ExecutionState::Closed;
+                    }
+                }
+            } else {
+                self.merge_mismatch_count = self.merge_mismatch_count.saturating_add(1);
+                let err_msg = msg.error.unwrap_or_else(|| "unknown merge failure".to_string());
+                self.log_action(&format!(
+                    "⚠️ Merge failed: {:.2} shares for {} — {}",
+                    released_size, msg.condition_id, err_msg
+                ))
+                .await;
+                self.trade_logger
+                    .log_merge(
+                        &msg.condition_id,
+                        Some(&msg.question),
+                        released_size,
+                        false,
+                        Some(err_msg.clone()),
+                    )
+                    .await;
+                for batch in self.execution_batches.values_mut() {
+                    if batch.condition_id == msg.condition_id && batch.state == ExecutionState::MergePending {
+                        batch.state = ExecutionState::Failed;
+                    }
                 }
             }
-        });
+        }
     }
 
     // ─── Redemption ────────────────────────────────────────────────────────────
@@ -1697,7 +2090,7 @@ impl MarketMonitor {
 
                     info!("Maker fills: YES={yes_filled:.2} NO={no_filled:.2}");
 
-                    let fire_amount = self.position.mergeable_amount();
+                    let fire_amount = self.mergeable_available();
                     if fire_amount >= 1.0 {
                         self.fire_merge(fire_amount, &mi).await;
                     }
@@ -1718,18 +2111,28 @@ impl MarketMonitor {
                         "order" => {
                             if let Ok(ev) = serde_json::from_value::<crate::types::WsOrderEvent>(msg) {
                                 debug!("WS Order Event: {} | {} | {} | matched: {}", ev.id, ev.side, ev.status, ev.size_matched);
-                                // The balance/position logic here could be very complex for partial fills.
-                                // We are currently tracking this gracefully in our `execute_batch` HTTP loop,
-                                // but we log this to confirm User WS works flawlessly.
-                                // In the future, we can drop HTTP `poll_fills` entirely.
+                                let matched = ev.size_matched.parse::<f64>().unwrap_or(0.0);
+                                self.update_order_fill_state(&ev.id, matched, Utc::now(), true);
                             }
                         }
                         "trade" => {
                             if let Ok(ev) = serde_json::from_value::<crate::types::WsTradeEvent>(msg) {
                                 info!("WS Trade Event: Executed {} {} shares of {} at {}", ev.side, ev.size, ev.asset_id, ev.price);
                                 self.active_assets.insert(ev.asset_id);
-                                // This provides ultra-low latency confirmation that our order actually matched.
-                                // We rely on this stream going forward to maintain zero-query position state.
+                                if let Ok(delta) = ev.size.parse::<f64>() {
+                                    if let Some(curr) = self
+                                        .order_tracker
+                                        .get(&ev.taker_order_id)
+                                        .map(|leg| leg.matched_size)
+                                    {
+                                        self.update_order_fill_state(
+                                            &ev.taker_order_id,
+                                            curr + delta,
+                                            Utc::now(),
+                                            true,
+                                        );
+                                    }
+                                }
                             }
                         }
                         "balance" => {
@@ -1889,7 +2292,113 @@ impl MarketMonitor {
         );
     }
 
+    pub async fn run_merge_reconcile_cycle(monitor: &Arc<Mutex<Self>>) {
+        let (client, market_opt, mock_mode, holder) = {
+            let mut m = match monitor.try_lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            m.process_merge_results().await;
+            (
+                Arc::clone(&m.client),
+                m.market_info.clone(),
+                m.config.mock_currency,
+                m.client.maker_address(),
+            )
+        };
+        if mock_mode {
+            return;
+        }
+        let Some(mi) = market_opt else {
+            return;
+        };
+        let rpc = crate::clob_client::POLYGON_RPCS[0];
+        let (yes_on_chain, no_on_chain) = tokio::join!(
+            client.get_ctf_balance(&mi.tokens.yes, holder, rpc),
+            client.get_ctf_balance(&mi.tokens.no, holder, rpc),
+        );
+        let yes_on_chain = yes_on_chain.unwrap_or(0.0);
+        let no_on_chain = no_on_chain.unwrap_or(0.0);
+
+        let mut m = match monitor.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let yes_drift = (yes_on_chain - m.position.yes_size).abs();
+        let no_drift = (no_on_chain - m.position.no_size).abs();
+        let max_reservable = m.position.mergeable_amount();
+        if m.pending_merge_reserved_size > max_reservable + 0.01 {
+            m.merge_mismatch_count = m.merge_mismatch_count.saturating_add(1);
+            m.pending_merge_reserved_size = max_reservable.max(0.0);
+        }
+        if yes_drift > 2.0 || no_drift > 2.0 {
+            m.merge_mismatch_count = m.merge_mismatch_count.saturating_add(1);
+            let in_mem_yes = m.position.yes_size;
+            let in_mem_no = m.position.no_size;
+            m.log_action_fast(&format!(
+                "⚠️ Reconcile drift detected: on-chain YES/NO {:.2}/{:.2} vs in-mem {:.2}/{:.2}",
+                yes_on_chain, no_on_chain, in_mem_yes, in_mem_no
+            ));
+        }
+    }
+
     // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    fn mergeable_available(&self) -> f64 {
+        (self.position.mergeable_amount() - self.pending_merge_reserved_size).max(0.0)
+    }
+
+    fn estimate_buy_cost_from_book(book: &OrderBook, size: f64) -> Option<f64> {
+        if size <= 0.0 {
+            return Some(0.0);
+        }
+        let mut remaining = size;
+        let mut total_cost = 0.0;
+        for level in &book.asks {
+            let px = level.price_f64();
+            let lvl_size = level.size_f64();
+            if px <= 0.0 || lvl_size <= 0.0 {
+                continue;
+            }
+            let take = remaining.min(lvl_size);
+            total_cost += take * px;
+            remaining -= take;
+            if remaining <= 1e-9 {
+                break;
+            }
+        }
+        if remaining > 1e-6 {
+            None
+        } else {
+            Some(total_cost)
+        }
+    }
+
+    fn estimate_sell_proceeds_from_book(book: &OrderBook, size: f64) -> Option<f64> {
+        if size <= 0.0 {
+            return Some(0.0);
+        }
+        let mut remaining = size;
+        let mut proceeds = 0.0;
+        for level in &book.bids {
+            let px = level.price_f64();
+            let lvl_size = level.size_f64();
+            if px <= 0.0 || lvl_size <= 0.0 {
+                continue;
+            }
+            let take = remaining.min(lvl_size);
+            proceeds += take * px;
+            remaining -= take;
+            if remaining <= 1e-9 {
+                break;
+            }
+        }
+        if remaining > 1e-6 {
+            None
+        } else {
+            Some(proceeds)
+        }
+    }
 
     fn env_u64(key: &str, default: u64) -> u64 {
         std::env::var(key)
@@ -2069,6 +2578,10 @@ impl MarketMonitor {
 
     fn push_latency_sample(samples: &mut VecDeque<u64>, elapsed: Duration) {
         let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        Self::push_latency_value(samples, ms);
+    }
+
+    fn push_latency_value(samples: &mut VecDeque<u64>, ms: u64) {
         samples.push_back(ms);
         while samples.len() > PERF_WINDOW_SAMPLES {
             samples.pop_front();
@@ -2101,6 +2614,12 @@ impl MarketMonitor {
         let lock_wait_p95 = Self::percentile(&self.lock_wait_latency_ms, 0.95).unwrap_or(0);
         let render_p50 = Self::percentile(&self.render_latency_ms, 0.50).unwrap_or(0);
         let render_p95 = Self::percentile(&self.render_latency_ms, 0.95).unwrap_or(0);
+        let detect_submit_p50 = Self::percentile(&self.detect_to_submit_latency_ms, 0.50).unwrap_or(0);
+        let detect_submit_p95 = Self::percentile(&self.detect_to_submit_latency_ms, 0.95).unwrap_or(0);
+        let first_fill_p50 = Self::percentile(&self.first_fill_latency_ms, 0.50).unwrap_or(0);
+        let first_fill_p95 = Self::percentile(&self.first_fill_latency_ms, 0.95).unwrap_or(0);
+        let pair_p50 = Self::percentile(&self.pair_complete_latency_ms, 0.50).unwrap_or(0);
+        let pair_p95 = Self::percentile(&self.pair_complete_latency_ms, 0.95).unwrap_or(0);
         let action_q = self
             .session_logger
             .as_ref()
@@ -2118,12 +2637,41 @@ impl MarketMonitor {
         } else {
             0.0
         };
+        let opp_to_post_rate = if self.opportunity_detected_count > 0 {
+            self.post_attempt_count as f64 / self.opportunity_detected_count as f64
+        } else {
+            0.0
+        };
+        let post_to_paired_rate = if self.post_attempt_count > 0 {
+            self.post_paired_count as f64 / self.post_attempt_count as f64
+        } else {
+            0.0
+        };
+        let hedge_rate = if self.post_attempt_count > 0 {
+            self.hedge_event_count as f64 / self.post_attempt_count as f64
+        } else {
+            0.0
+        };
+        let stale_poll_rate = if self.post_attempt_count > 0 {
+            self.stale_poll_fallback_count as f64 / self.post_attempt_count as f64
+        } else {
+            0.0
+        };
 
         info!(
-            "Perf latency (ms) | check {}/{} n={} | claim {}/{} n={} | balance {}/{} n={} | lock-wait {}/{} n={} | render {}/{} n={} | queue action/trade={}/{} dropped action/trade={}/{} | opp checks={} qual={} ({:.2}%) extreme={} size={} profit={} executed={}",
+            "Perf latency (ms) | check {}/{} n={} | detect->submit {}/{} n={} | first-fill {}/{} n={} | pair-complete {}/{} n={} | claim {}/{} n={} | balance {}/{} n={} | lock-wait {}/{} n={} | render {}/{} n={} | queue action/trade={}/{} dropped action/trade={}/{} | opp checks={} qual={} ({:.2}%) extreme={} size={} profit={} executed={} | ratios opp->post={:.3} post->paired={:.3} hedge={:.3} stale-poll={:.3} merge-mismatch={}",
             check_p50,
             check_p95,
             self.check_latency_ms.len(),
+            detect_submit_p50,
+            detect_submit_p95,
+            self.detect_to_submit_latency_ms.len(),
+            first_fill_p50,
+            first_fill_p95,
+            self.first_fill_latency_ms.len(),
+            pair_p50,
+            pair_p95,
+            self.pair_complete_latency_ms.len(),
             claim_p50,
             claim_p95,
             self.claim_latency_ms.len(),
@@ -2146,7 +2694,12 @@ impl MarketMonitor {
             self.checks_skipped_extreme,
             self.checks_skipped_size,
             self.checks_skipped_profit,
-            self.checks_executed
+            self.checks_executed,
+            opp_to_post_rate,
+            post_to_paired_rate,
+            hedge_rate,
+            stale_poll_rate,
+            self.merge_mismatch_count
         );
     }
 
@@ -2282,6 +2835,7 @@ impl MarketMonitor {
 mod tests {
     use super::*;
     use crate::types::{OrderResponse, PriceLevel};
+    use tokio::sync::mpsc;
 
     fn mock_config() -> Option<Arc<Config>> {
         dotenv::dotenv().ok();
@@ -2300,6 +2854,14 @@ mod tests {
         cfg.maker_mode_enabled = false;
         cfg.maker_spread_ticks = 2;
         cfg.gtc_taker_timeout_ms = 5_000;
+        cfg.ws_fill_primary = true;
+        cfg.ws_fill_fallback_poll_ms = 300;
+        cfg.adaptive_throttle_min_ms = 0;
+        cfg.adaptive_throttle_burst_debounce_ms = 8;
+        cfg.actionable_delta_min_ticks = 1;
+        cfg.shadow_engine_enabled = false;
+        cfg.shadow_engine_send_orders = false;
+        cfg.merge_reconcile_interval_secs = 5;
         cfg.clob_fee_rate = 0.15;
         cfg.clob_fee_exponent = 2.0;
         Some(Arc::new(cfg))
@@ -2309,6 +2871,7 @@ mod tests {
         let config = mock_config()?;
 
         let client = ClobClient::new(Arc::clone(&config)).await.ok()?;
+        let (merge_result_tx, merge_result_rx) = mpsc::unbounded_channel();
         Some(MarketMonitor {
             config: Arc::clone(&config),
             client: Arc::new(client),
@@ -2340,6 +2903,15 @@ mod tests {
             errors: Vec::new(),
             is_redeeming: Arc::new(AtomicBool::new(false)),
             pending_claim_value: 0.0,
+            order_tracker: HashMap::new(),
+            order_to_batch: HashMap::new(),
+            execution_batches: HashMap::new(),
+            ws_fill_last_event_at: None,
+            last_actionable_snapshot: None,
+            pending_merges: HashMap::new(),
+            pending_merge_reserved_size: 0.0,
+            merge_result_tx,
+            merge_result_rx,
             dashboard: Dashboard::new(),
             last_balance: Some(1000.0),
             last_balance_refresh: Instant::now(),
@@ -2356,6 +2928,9 @@ mod tests {
             claim_retry_after: HashMap::new(),
             claim_success_suppression_until: HashMap::new(),
             check_latency_ms: VecDeque::new(),
+            detect_to_submit_latency_ms: VecDeque::new(),
+            first_fill_latency_ms: VecDeque::new(),
+            pair_complete_latency_ms: VecDeque::new(),
             claim_latency_ms: VecDeque::new(),
             balance_latency_ms: VecDeque::new(),
             lock_wait_latency_ms: VecDeque::new(),
@@ -2366,6 +2941,12 @@ mod tests {
             checks_skipped_size: 0,
             checks_skipped_profit: 0,
             checks_executed: 0,
+            opportunity_detected_count: 0,
+            post_attempt_count: 0,
+            post_paired_count: 0,
+            hedge_event_count: 0,
+            stale_poll_fallback_count: 0,
+            merge_mismatch_count: 0,
             perf_last_log: Instant::now(),
             render_requested: true,
         })

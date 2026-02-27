@@ -23,6 +23,14 @@ pub struct Config {
     pub maker_mode_enabled: bool,
     pub maker_spread_ticks: u32,
     pub gtc_taker_timeout_ms: u64,
+    pub ws_fill_primary: bool,
+    pub ws_fill_fallback_poll_ms: u64,
+    pub adaptive_throttle_min_ms: u64,
+    pub adaptive_throttle_burst_debounce_ms: u64,
+    pub actionable_delta_min_ticks: u32,
+    pub shadow_engine_enabled: bool,
+    pub shadow_engine_send_orders: bool,
+    pub merge_reconcile_interval_secs: u64,
     pub clob_fee_rate: f64,
     pub clob_fee_exponent: f64,
 }
@@ -117,6 +125,38 @@ impl Config {
                 .unwrap_or_else(|_| "5000".to_string())
                 .parse()
                 .unwrap_or(5000),
+            ws_fill_primary: env::var("WS_FILL_PRIMARY")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            ws_fill_fallback_poll_ms: env::var("WS_FILL_FALLBACK_POLL_MS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
+            adaptive_throttle_min_ms: env::var("ADAPTIVE_THROTTLE_MIN_MS")
+                .unwrap_or_else(|_| "0".to_string())
+                .parse()
+                .unwrap_or(0),
+            adaptive_throttle_burst_debounce_ms: env::var("ADAPTIVE_THROTTLE_BURST_DEBOUNCE_MS")
+                .unwrap_or_else(|_| "8".to_string())
+                .parse()
+                .unwrap_or(8),
+            actionable_delta_min_ticks: env::var("ACTIONABLE_DELTA_MIN_TICKS")
+                .unwrap_or_else(|_| "1".to_string())
+                .parse()
+                .unwrap_or(1),
+            shadow_engine_enabled: env::var("SHADOW_ENGINE_ENABLED")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            shadow_engine_send_orders: env::var("SHADOW_ENGINE_SEND_ORDERS")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            merge_reconcile_interval_secs: env::var("MERGE_RECONCILE_INTERVAL_SECS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .unwrap_or(5),
             clob_fee_rate: env_f64("CLOB_FEE_RATE", 0.25)?,
             clob_fee_exponent: env_f64("CLOB_FEE_EXPONENT", 2.0)?,
         })

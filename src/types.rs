@@ -100,6 +100,65 @@ pub struct ArbOpportunity {
     pub spread: f64,
 }
 
+// ─── Execution State Machine ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionState {
+    Planned,
+    Posted,
+    Partial,
+    Paired,
+    HedgePending,
+    SoldBack,
+    MergePending,
+    Closed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderLegState {
+    pub token_id: String,
+    pub order_id: String,
+    pub target_size: f64,
+    pub matched_size: f64,
+    pub last_update_ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionBatchState {
+    pub batch_id: String,
+    pub condition_id: String,
+    pub state: ExecutionState,
+    pub yes_leg: OrderLegState,
+    pub no_leg: OrderLegState,
+    pub detect_ts: DateTime<Utc>,
+    pub sign_start_ts: Option<DateTime<Utc>>,
+    pub sign_end_ts: Option<DateTime<Utc>>,
+    pub post_start_ts: Option<DateTime<Utc>>,
+    pub post_end_ts: Option<DateTime<Utc>>,
+    pub first_fill_event_ts: Option<DateTime<Utc>>,
+    pub paired_complete_ts: Option<DateTime<Utc>>,
+    pub expected_pnl_usd: Option<f64>,
+    pub realized_pnl_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PendingMergeStatus {
+    Submitted,
+    Confirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingMergeState {
+    pub merge_id: String,
+    pub condition_id: String,
+    pub size: f64,
+    pub tx_hash: Option<String>,
+    pub status: PendingMergeStatus,
+    pub created_at: DateTime<Utc>,
+}
+
 // ─── Order ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

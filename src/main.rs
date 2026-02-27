@@ -109,16 +109,12 @@ async fn main() -> Result<()> {
     let monitor_gas = Arc::clone(&monitor);
     let monitor_claim = Arc::clone(&monitor);
     let monitor_render = Arc::clone(&monitor);
+    let monitor_merge_reconcile = Arc::clone(&monitor);
 
-    // 1. Opportunity check — WS-driven (event-based with 20ms throttle) with 5s REST heartbeat fallback
-    //    Mirrors TypeScript bot: fires checkOpportunity() instantly on WS book updates.
-    //    Runs REST every 5s as a heartbeat if WS is quiet.
+    // 1. Opportunity check — WS-driven with adaptive triggering + 5s REST heartbeat fallback.
     let arb_handle = tokio::spawn(async move {
-        const WS_THROTTLE: Duration = Duration::from_millis(20);
         const REST_HEARTBEAT: Duration = Duration::from_millis(5_000);
         const REST_FALLBACK: Duration = Duration::from_millis(1_000);
-        
-        let mut last_check = std::time::Instant::now() - WS_THROTTLE;
 
         loop {
             let notify_opt = if let Ok(m) = monitor_arb.try_lock() {
@@ -131,14 +127,12 @@ async fn main() -> Result<()> {
             if let Some(notify) = notify_opt {
                 tokio::select! {
                     _ = notify.notified() => {
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_check) >= WS_THROTTLE {
-                            last_check = now;
-                            let lock_wait_start = std::time::Instant::now();
-                            let mut m = monitor_arb.lock().await;
-                            let lock_wait = lock_wait_start.elapsed();
+                        let lock_wait_start = std::time::Instant::now();
+                        let mut m = monitor_arb.lock().await;
+                        let lock_wait = lock_wait_start.elapsed();
+                        m.record_lock_wait_latency_sample(lock_wait);
+                        if m.should_run_on_ws_notify().await {
                             let started = std::time::Instant::now();
-                            m.record_lock_wait_latency_sample(lock_wait);
                             m.check_opportunity().await;
                             m.record_check_latency_sample(started.elapsed());
                         }
@@ -218,7 +212,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 7. Dashboard render worker (every 250ms, decoupled from strategy hot path)
+    // 7. Merge reconciliation worker (config-driven)
+    let merge_reconcile_secs = config.merge_reconcile_interval_secs.max(1);
+    let merge_reconcile_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(merge_reconcile_secs));
+        loop {
+            interval.tick().await;
+            MarketMonitor::run_merge_reconcile_cycle(&monitor_merge_reconcile).await;
+        }
+    });
+
+    // 8. Dashboard render worker (every 250ms, decoupled from strategy hot path)
     let render_handle = tokio::spawn(async move {
         let render_interval_ms = env_u64("DASHBOARD_RENDER_INTERVAL_MS", 250);
         let mut interval = tokio::time::interval(Duration::from_millis(render_interval_ms));
@@ -241,6 +245,7 @@ async fn main() -> Result<()> {
     balance_handle.abort();
     gas_handle.abort();
     claim_handle.abort();
+    merge_reconcile_handle.abort();
     render_handle.abort();
 
     // Graceful shutdown
