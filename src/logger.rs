@@ -6,9 +6,11 @@
 use anyhow::Result;
 use chrono::{Local, Utc};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -21,6 +23,7 @@ pub struct SessionLogger {
     sender: mpsc::Sender<LogMsg>,
     path: PathBuf,
     join_handle: Option<tokio::task::JoinHandle<()>>,
+    dropped_lines: AtomicU64,
 }
 
 impl SessionLogger {
@@ -75,6 +78,7 @@ impl SessionLogger {
             sender,
             path,
             join_handle: Some(join_handle),
+            dropped_lines: AtomicU64::new(0),
         };
 
         // Write session header
@@ -106,18 +110,46 @@ impl SessionLogger {
 
     /// Log an action with a timestamp prefix.
     pub async fn log(&self, msg: &str) {
-        let ts = Local::now().format("%I:%M:%S %p");
-        self.write_raw(&format!("[{ts}] {msg}")).await;
+        self.try_log(msg);
     }
 
     /// Log an error.
     pub async fn error(&self, msg: &str) {
-        let ts = Local::now().format("%I:%M:%S %p");
-        self.write_raw(&format!("[{ts}] ERROR: {msg}")).await;
+        self.try_error(msg);
     }
 
     pub async fn write_raw(&self, line: &str) {
-        let _ = self.sender.send(LogMsg::Line(line.to_string())).await;
+        self.try_write_raw(line);
+    }
+
+    pub fn try_log(&self, msg: &str) {
+        let ts = Local::now().format("%I:%M:%S %p");
+        self.try_write_raw(&format!("[{ts}] {msg}"));
+    }
+
+    pub fn try_error(&self, msg: &str) {
+        let ts = Local::now().format("%I:%M:%S %p");
+        self.try_write_raw(&format!("[{ts}] ERROR: {msg}"));
+    }
+
+    pub fn try_write_raw(&self, line: &str) {
+        match self.sender.try_send(LogMsg::Line(line.to_string())) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.dropped_lines.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Closed(_)) => {}
+        }
+    }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_lines.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.sender
+            .max_capacity()
+            .saturating_sub(self.sender.capacity())
     }
 
     /// Flush the error summary and close the log file.

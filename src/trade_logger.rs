@@ -7,9 +7,11 @@ use crate::types::{TradeLogEntry, TradeType};
 use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -21,6 +23,7 @@ pub struct TradeLogger {
     sender: mpsc::Sender<LogMsg>,
     #[allow(dead_code)]
     path: PathBuf,
+    dropped_entries: AtomicU64,
 }
 
 impl TradeLogger {
@@ -61,13 +64,33 @@ impl TradeLogger {
             let _ = file.flush().await;
         });
 
-        Ok(Self { sender, path })
+        Ok(Self {
+            sender,
+            path,
+            dropped_entries: AtomicU64::new(0),
+        })
     }
 
     pub async fn log(&self, entry: TradeLogEntry) {
-        if let Err(e) = self.sender.send(LogMsg::Entry(entry)).await {
-            warn!("TradeLogger cache full or receiver dropped: {e}");
+        match self.sender.try_send(LogMsg::Entry(entry)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.dropped_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Closed(e)) => {
+                warn!("TradeLogger receiver dropped: {:?}", e);
+            }
         }
+    }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_entries.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.sender
+            .max_capacity()
+            .saturating_sub(self.sender.capacity())
     }
 
     pub async fn log_execution(

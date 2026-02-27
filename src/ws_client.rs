@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 /// If no WS update arrives for this long, we temporarily allow REST fallback.
 /// Keep this comfortably above normal burst gaps to avoid unnecessary REST polling.
-pub const BOOK_STALE_THRESHOLD_MS: u64 = 60_000;
+pub const BOOK_STALE_THRESHOLD_MS: u64 = 8_000;
 
 struct BookEntry {
     book: OrderBook,

@@ -47,6 +47,7 @@ pub struct DashboardState<'a> {
 
     // Data source
     pub data_source: &'a str, // "WS" or "REST"
+    pub ws_connected: bool,
     pub ws_yes_age_ms: Option<u64>,
     pub ws_no_age_ms: Option<u64>,
 }
@@ -258,6 +259,14 @@ impl Dashboard {
         out.push_str(&format!(
             "📈 LIVE MARKET DATA ({}) (Last {} ticks)\n",
             state.data_source, MAX_PRICE_TICKS
+        ));
+        out.push_str(&format!(
+            "   WS status: {}\n",
+            if state.ws_connected {
+                "connected"
+            } else {
+                "disconnected"
+            }
         ));
         if let (Some(yes_age), Some(no_age)) = (state.ws_yes_age_ms, state.ws_no_age_ms) {
             out.push_str(&format!(

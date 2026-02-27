@@ -19,6 +19,13 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ─── Tracing / Logging (→ file, not stdout) ──────────────────────────────
@@ -27,6 +34,7 @@ async fn main() -> Result<()> {
     // so it doesn't interleave with the dashboard rendering.
     fs::create_dir_all("logs").ok();
     let log_file = fs::File::create("logs/bot.log")?;
+    let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("RUST_LOG")
@@ -35,7 +43,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .with_ansi(false)
-        .with_writer(log_file)
+        .with_writer(non_blocking)
         .init();
 
     // Print startup banner to stdout (visible before dashboard takes over)
@@ -100,6 +108,7 @@ async fn main() -> Result<()> {
     let monitor_balance = Arc::clone(&monitor);
     let monitor_gas = Arc::clone(&monitor);
     let monitor_claim = Arc::clone(&monitor);
+    let monitor_render = Arc::clone(&monitor);
 
     // 1. Opportunity check — WS-driven (event-based with 20ms throttle) with 5s REST heartbeat fallback
     //    Mirrors TypeScript bot: fires checkOpportunity() instantly on WS book updates.
@@ -112,7 +121,12 @@ async fn main() -> Result<()> {
         let mut last_check = std::time::Instant::now() - WS_THROTTLE;
 
         loop {
-            let notify_opt = { monitor_arb.lock().await.get_ws_notify() };
+            let notify_opt = if let Ok(m) = monitor_arb.try_lock() {
+                m.get_ws_notify()
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            };
 
             if let Some(notify) = notify_opt {
                 tokio::select! {
@@ -120,24 +134,33 @@ async fn main() -> Result<()> {
                         let now = std::time::Instant::now();
                         if now.duration_since(last_check) >= WS_THROTTLE {
                             last_check = now;
+                            let lock_wait_start = std::time::Instant::now();
                             let mut m = monitor_arb.lock().await;
+                            let lock_wait = lock_wait_start.elapsed();
                             let started = std::time::Instant::now();
+                            m.record_lock_wait_latency_sample(lock_wait);
                             m.check_opportunity().await;
                             m.record_check_latency_sample(started.elapsed());
                         }
                     }
                     _ = tokio::time::sleep(REST_HEARTBEAT) => {
                         // 5s Heartbeat when WS is connected but silent
+                        let lock_wait_start = std::time::Instant::now();
                         let mut m = monitor_arb.lock().await;
+                        let lock_wait = lock_wait_start.elapsed();
                         let started = std::time::Instant::now();
+                        m.record_lock_wait_latency_sample(lock_wait);
                         m.check_opportunity().await;
                         m.record_check_latency_sample(started.elapsed());
                     }
                 }
             } else {
                 // Fully disconnected fallback: poll every 1s
+                let lock_wait_start = std::time::Instant::now();
                 let mut m = monitor_arb.lock().await;
+                let lock_wait = lock_wait_start.elapsed();
                 let started = std::time::Instant::now();
+                m.record_lock_wait_latency_sample(lock_wait);
                 m.check_opportunity().await;
                 m.record_check_latency_sample(started.elapsed());
                 drop(m);
@@ -151,8 +174,9 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(2_000));
         loop {
             interval.tick().await;
-            let mut m = monitor_maker.lock().await;
-            m.check_maker_fills().await;
+            if let Ok(mut m) = monitor_maker.try_lock() {
+                m.check_maker_fills().await;
+            }
         }
     });
 
@@ -161,8 +185,9 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let mut m = monitor_ws.lock().await;
-            m.check_ws_health().await;
+            if let Ok(mut m) = monitor_ws.try_lock() {
+                m.check_ws_health().await;
+            }
         }
     });
 
@@ -193,6 +218,18 @@ async fn main() -> Result<()> {
         }
     });
 
+    // 7. Dashboard render worker (every 250ms, decoupled from strategy hot path)
+    let render_handle = tokio::spawn(async move {
+        let render_interval_ms = env_u64("DASHBOARD_RENDER_INTERVAL_MS", 250);
+        let mut interval = tokio::time::interval(Duration::from_millis(render_interval_ms));
+        loop {
+            interval.tick().await;
+            if let Ok(mut m) = monitor_render.try_lock() {
+                m.render_if_requested();
+            }
+        }
+    });
+
     // ─── Shutdown Signal ─────────────────────────────────────────────────────
     signal::ctrl_c().await?;
     println!("\nShutdown signal received");
@@ -204,6 +241,7 @@ async fn main() -> Result<()> {
     balance_handle.abort();
     gas_handle.abort();
     claim_handle.abort();
+    render_handle.abort();
 
     // Graceful shutdown
     {

@@ -22,6 +22,7 @@ use tracing::info;
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
 const MARKET_EXPIRY_BUFFER_SECS: i64 = 10;
+const SAFE_RECEIPT_TIMEOUT_SECS: u64 = 20;
 pub const POLYGON_RPCS: [&str; 3] = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://1rpc.io/matic",
@@ -890,9 +891,15 @@ impl ClobClient {
 
         let tx_hash = *pending_tx.tx_hash();
 
-        pending_tx
-            .get_receipt()
+        let receipt_timeout_secs = env_u64("SAFE_RECEIPT_TIMEOUT_SECS", SAFE_RECEIPT_TIMEOUT_SECS);
+        tokio::time::timeout(Duration::from_secs(receipt_timeout_secs), pending_tx.get_receipt())
             .await
+            .with_context(|| {
+                format!(
+                    "Gnosis Safe execTransaction: receipt wait timed out after {}s",
+                    receipt_timeout_secs
+                )
+            })?
             .context("Gnosis Safe execTransaction: tx dropped from mempool")?;
 
         Ok(tx_hash)
@@ -928,6 +935,13 @@ fn parse_token_id(token_id: &str) -> Result<U256> {
         U256::from_str_radix(token_id, 10)
             .map_err(|e| anyhow::anyhow!("Invalid decimal token_id '{}': {}", token_id, e))
     }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 fn select_market_candidates(
