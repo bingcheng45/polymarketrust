@@ -755,16 +755,10 @@ impl MarketMonitor {
         let mut failed_batches = 0;
 
         for batch in 0..batches {
-            let this_size = if batch == batches - 1 {
-                let remainder = total_size - (batch as f64 * batch_size);
-                if remainder > 0.0 {
-                    (remainder * 100.0).floor() / 100.0 + batch_size
-                } else {
-                    batch_size
-                }
-            } else {
-                batch_size
-            };
+            let this_size = Self::batch_order_size(batch, batches, total_size, batch_size);
+            if this_size <= 0.0 {
+                continue;
+            }
 
             let cheap_str = if opp.yes_price <= opp.no_price {
                 format!("UP@{} (cheap first) + DOWN@{}", opp.yes_price, opp.no_price)
@@ -955,12 +949,19 @@ impl MarketMonitor {
                 .await;
 
             let fill_msg = format!(
-                "✅ Filled Up={yes_filled:.2} Down={no_filled:.2} | profit=${profit:.4}"
+                "✅ ARB fill: Buy UP {yes_filled:.2} @ {:.2} + DOWN {no_filled:.2} @ {:.2} | entry ${cost:.2}",
+                opp.yes_price,
+                opp.no_price
             );
             self.log_action(&fill_msg).await;
-            if let Some(ref logger) = self.session_logger {
-                logger.try_log(&fill_msg);
-            }
+
+            let expected_payout = mergeable;
+            let gross_profit = expected_payout - cost;
+            let roi_pct = if cost > 0.0 { (profit / cost) * 100.0 } else { 0.0 };
+            self.log_action(&format!(
+                "📦 Exit estimate: ${expected_payout:.2} payout (merge) | gross ${gross_profit:+.2} | net ${profit:+.2} ({roi_pct:+.2}%)"
+            ))
+            .await;
 
             Ok(profit)
         } else if yes_filled > 0.05 || no_filled > 0.05 {
@@ -1910,6 +1911,18 @@ impl MarketMonitor {
         yes_filled >= target_fill && no_filled >= target_fill
     }
 
+    fn batch_order_size(batch_idx: usize, total_batches: usize, total_size: f64, batch_size: f64) -> f64 {
+        if total_batches == 0 {
+            return 0.0;
+        }
+        if batch_idx + 1 == total_batches {
+            let remaining = (total_size - (batch_idx as f64 * batch_size)).max(0.0);
+            (remaining * 100.0).floor() / 100.0
+        } else {
+            batch_size
+        }
+    }
+
     async fn sample_ws_age_if_due(&mut self, mi: &MarketInfo) {
         let due = self
             .last_ws_age_sample
@@ -2432,5 +2445,14 @@ mod tests {
         assert!(MarketMonitor::fills_sufficient(19.0, 19.1, 20.0));
         assert!(!MarketMonitor::fills_sufficient(18.99, 19.5, 20.0));
         assert!(!MarketMonitor::fills_sufficient(19.5, 18.99, 20.0));
+    }
+
+    #[test]
+    fn test_batch_order_size_last_batch_remainder_not_doubled() {
+        // 12 shares split into 2x6 should produce 6 in both batches.
+        let b1 = MarketMonitor::batch_order_size(0, 2, 12.0, 6.0);
+        let b2 = MarketMonitor::batch_order_size(1, 2, 12.0, 6.0);
+        assert_eq!(b1, 6.0);
+        assert_eq!(b2, 6.0);
     }
 }
