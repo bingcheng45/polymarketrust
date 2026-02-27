@@ -1,18 +1,20 @@
 # polymarketrust
 
-A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScript logic from [`polymarket`](../polymarket) into idiomatic Rust, using `tokio` for async I/O and `ethers-rs` for on-chain interactions.
+A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScript logic from [`polymarket`](../polymarket) into idiomatic Rust, using `tokio` for async I/O and on-chain interactions.
 
 ## Features
 
-- **Arbitrage detection** — scans YES+NO leg orderbooks every second; executes when combined ask price < 1.0 (minus fees/gas)
+- **WS-driven arbitrage detection** — event-based strategy loop (20ms throttle) with REST fallback heartbeat
 - **GTC batched execution** — signs both legs concurrently, posts atomically, polls for fills
 - **Partial-fill recovery** — smart hedge-or-sell-back when only one leg fills
 - **WebSocket orderbook feed** — real-time updates from Polymarket's WS API with REST fallback
 - **Maker mode** — optional GTC limit orders posted below best ask instead of FOK taker orders
 - **Dynamic fee calculation** — `fee = CLOB_FEE_RATE × (price × (1 − price))^CLOB_FEE_EXPONENT`
-- **Gas-aware profitability** — fetches live POL price and gas price; includes merge gas in profit check
+- **Background maintenance workers** — balance (2s), claim polling (5s), and gas cache refresh (30s) off the WS hot path
+- **Gas-aware profitability** — uses cached gas/POL pricing in strategy hot path
 - **Circuit breaker** — pauses trading after N consecutive failures or daily loss limit
 - **Position tracking** — recovers open YES/NO positions from trade history across restarts
+- **Claim automation** — discovers redeemable conditions from Data API and redeems through Safe/EOA flow
 - **Persistent stats** — `logs/market_stats.json` updated on market rollover
 - **JSONL trade log** — every trade event appended to `logs/trades.jsonl`
 - **Session log** — human-readable session file at `logs/session_<timestamp>.txt`
@@ -43,7 +45,10 @@ cargo run --bin check_proxy
 # 6. Verify connectivity with a test order
 cargo run --bin test_order
 
-# 7. Run the bot
+# 7. Inspect claimable conditions (optional)
+cargo run --bin check_claim
+
+# 8. Run the bot
 cargo run --release
 ```
 
@@ -80,7 +85,36 @@ src/
 └── bin/
     ├── biogen.rs      # Generate API credentials
     ├── check_proxy.rs # Proxy wallet diagnostics
+    ├── check_claim.rs # Claimability + redemption diagnostics
     └── test_order.rs  # Single order connectivity test
+```
+
+## Runtime Logic UML
+
+The current runtime architecture is documented in [`docs/runtime-logic-uml.md`](docs/runtime-logic-uml.md), including:
+
+- WS hot-path flow
+- background maintenance workers
+- rollover/reconnect behavior
+- claim/redeem flow
+- known logic gaps and risk points
+
+Quick view:
+
+```mermaid
+flowchart LR
+    WS["Polymarket WS (Market/User)"] --> MC["ws_client.rs"]
+    MC --> N["Notify"]
+    N --> S["Strategy loop (check_opportunity)"]
+    S --> D["Dashboard (ticks/actions)"]
+    S --> O["Order execution path"]
+    O --> C["CLOB REST + on-chain tx"]
+
+    B["Balance worker (2s)"] --> C
+    G["Gas worker (30s)"] --> C
+    R["Claim worker (5s)"] --> P["Data API positions(redeemable=true)"]
+    R --> C
+    R --> D
 ```
 
 ## Fee Formula
@@ -97,12 +131,12 @@ Arbitrage is profitable when:
   yesAsk + noAsk < 1.0 − max(yesFee, noFee)
 ```
 
-## Known Gaps / Differences from TypeScript
+## Known Logic Gaps
 
-- **On-chain merge/redeem**: The `fire_merge` and `redeem_resolved_positions` methods log intent but do not yet execute the actual `mergePositions` / `redeemPositions` contract calls. This requires wiring in the ABIs via `ethers-rs` abigen! macros. The contract addresses and function signatures are documented in `clob_client.rs`.
-- **Proxy (Gnosis Safe) meta-transactions**: The TypeScript version uses `@polymarket/relayer-client` for gasless transactions. In Rust, this would use direct HTTP calls to the relayer endpoint.
-- **API key registration**: `biogen.rs` derives credentials deterministically, but they may need to be registered via the Polymarket API before first use.
-- **TUI dashboard**: The TypeScript bot has a terminal dashboard. Rust version uses structured tracing logs instead.
+- **WS delta cadence can appear bursty**: quiet periods with no orderbook deltas are expected; the dashboard currently shows change-only ticks.
+- **Single monitor mutex remains a contention risk**: network I/O was moved out of the strategy hot path, but long synchronous sections can still delay concurrent tasks.
+- **Safe redemption confirmation depth**: tx receipt success is tracked, but deeper Safe event-level validation should still be strengthened.
+- **Tooling parity**: `rustfmt` is not yet installed in the current environment, so formatting consistency depends on developer setup.
 
 ## Security
 

@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
     match client
-        .post("https://polygon-rpc.com")
+        .post("https://polygon-bor-rpc.publicnode.com")
         .json(&body)
         .send()
         .await

@@ -22,6 +22,11 @@ use tracing::info;
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
 const MARKET_EXPIRY_BUFFER_SECS: i64 = 10;
+pub const POLYGON_RPCS: [&str; 3] = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+    "https://polygon.drpc.org",
+];
 
 // Polygon contract addresses
 pub const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
@@ -39,6 +44,8 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::types::{OrderType as SdkOrderType, Side as SdkSide, AssetType, SignatureType};
 use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrderBookSummaryRequest, OrdersRequest, TradesRequest};
+use polymarket_client_sdk::data::Client as DataClient;
+use polymarket_client_sdk::data::types::request::PositionsRequest;
 // CTF client for on-chain operations
 use polymarket_client_sdk::ctf;
 use polymarket_client_sdk::ctf::types::{MergePositionsRequest, RedeemPositionsRequest};
@@ -50,6 +57,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer as AlloySigner;
 use alloy::sol_types::SolCall;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 // ─── Solidity interfaces via alloy sol! macro ─────────────────────────────────
@@ -358,23 +366,106 @@ impl ClobClient {
                 .maker_address(self.maker_address.0.0.into())
                 .build()
         };
-        let page = self.sdk_client.trades(&req, None).await?;
+        const TERMINAL_CURSOR: &str = "LTE=";
+        const MAX_TRADE_PAGES: usize = 50;
 
-        Ok(page.data.into_iter().map(|t| TradeRecord {
-            id: t.id,
-            condition_id: format!("{:?}", t.market),
-            token_id: t.asset_id.to_string(),
-            side: format!("{:?}", t.side).to_uppercase(),
-            price: t.price.to_string(),
-            size: t.size.to_string(),
-            fee_rate_bps: Some(t.fee_rate_bps.to_string()),
-            created_at: Some(t.match_time.timestamp().to_string()),
-        }).collect())
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            let page = self.sdk_client.trades(&req, cursor.clone()).await?;
+            out.extend(page.data.into_iter().map(|t| TradeRecord {
+                id: t.id,
+                condition_id: format!("{:?}", t.market),
+                token_id: t.asset_id.to_string(),
+                side: format!("{:?}", t.side).to_uppercase(),
+                price: t.price.to_string(),
+                size: t.size.to_string(),
+                fee_rate_bps: Some(t.fee_rate_bps.to_string()),
+                created_at: Some(t.match_time.timestamp().to_string()),
+            }));
+
+            pages += 1;
+            if page.next_cursor == TERMINAL_CURSOR || page.next_cursor.is_empty() {
+                break;
+            }
+            if pages >= MAX_TRADE_PAGES {
+                info!(
+                    "Trade pagination stopped at {} pages to avoid excessive API usage",
+                    MAX_TRADE_PAGES
+                );
+                break;
+            }
+            cursor = Some(page.next_cursor);
+        }
+
+        Ok(out)
     }
 
     pub async fn get_market_fee_rate_bps(&self, token_id: &str) -> Result<u64> {
         let resp = self.sdk_client.fee_rate_bps(U256::from_str(token_id)?).await?;
         Ok(resp.base_fee as u64)
+    }
+
+    /// Discover redeemable conditions for this wallet using Polymarket Data API.
+    ///
+    /// Returns tuples of `(condition_id, market_title, claimable_usdc)`.
+    pub async fn get_redeemable_conditions(&self) -> Result<Vec<(String, String, f64)>> {
+        const LIMIT: i32 = 500;
+        const MAX_OFFSET: i32 = 10_000;
+
+        let data_client = DataClient::default();
+        let mut offset = 0_i32;
+        let mut by_condition: HashMap<String, (String, f64)> = HashMap::new();
+
+        loop {
+            let req = PositionsRequest::builder()
+                .user(self.maker_address)
+                .redeemable(true)
+                .size_threshold(Decimal::ZERO)
+                .limit(LIMIT)?
+                .offset(offset)?
+                .build();
+
+            let positions = data_client.positions(&req).await?;
+            if positions.is_empty() {
+                break;
+            }
+
+            for pos in positions.iter() {
+                let current_value = pos.current_value.to_string().parse::<f64>().unwrap_or(0.0);
+                if current_value <= 0.0 {
+                    continue;
+                }
+
+                let condition_id = format!("{:?}", pos.condition_id);
+                let entry = by_condition
+                    .entry(condition_id)
+                    .or_insert_with(|| (pos.title.clone(), 0.0));
+                entry.1 += current_value;
+            }
+
+            if positions.len() < LIMIT as usize {
+                break;
+            }
+
+            offset += LIMIT;
+            if offset > MAX_OFFSET {
+                info!(
+                    "Redeemable position scan stopped at offset {} to avoid excessive API usage",
+                    MAX_OFFSET
+                );
+                break;
+            }
+        }
+
+        let mut out: Vec<(String, String, f64)> = by_condition
+            .into_iter()
+            .map(|(cid, (title, amount))| (cid, title, amount))
+            .collect();
+        out.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
     }
 
     // ─── Gamma API (Market Discovery) ────────────────────────────────────────
@@ -499,13 +590,7 @@ impl ClobClient {
             "id": 1
         });
 
-        let rpcs = [
-            "https://polygon-rpc.com",
-            "https://polygon.llamarpc.com",
-            "https://rpc.ankr.com/polygon",
-        ];
-
-        for rpc in &rpcs {
+        for rpc in &POLYGON_RPCS {
             if let Ok(resp) = self.http.post(*rpc).json(&body).send().await {
                 if let Ok(v) = resp.json::<Value>().await {
                     if let Some(hex_str) = v.get("result").and_then(|x| x.as_str()) {
@@ -657,10 +742,13 @@ impl ClobClient {
 
         let resp = self.http.post(rpc_url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        if let Some(err) = v.get("error") {
+            anyhow::bail!("RPC eth_call error: {}", err);
+        }
         let hex_result = v
             .get("result")
             .and_then(|x| x.as_str())
-            .unwrap_or("0x0");
+            .context("RPC eth_call missing result")?;
         let clean = hex_result.trim_start_matches("0x");
         let raw =
             u128::from_str_radix(if clean.is_empty() { "0" } else { clean }, 16).unwrap_or(0);

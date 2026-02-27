@@ -18,16 +18,16 @@ use crate::maker_strategy::MakerStrategy;
 use crate::market_stats::MarketStatsTracker;
 use crate::trade_logger::TradeLogger;
 use crate::types::{
-    ArbOpportunity, GammaMarket, GasCache, MarketInfo, OrderBook, Position, Side, TimeInForce,
+    ArbOpportunity, GasCache, MarketInfo, OrderBook, Position, Side, TimeInForce,
 };
 use crate::ws_client::WsClient;
 use anyhow::Result;
 use chrono::{Local, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 
@@ -41,6 +41,12 @@ const MAX_HEDGE_COOLDOWN_SECS: u64 = 120;
 const MARKET_DISCOVERY_RETRY_SECS: u64 = 5;
 // Claimability polling fallback interval.
 const CLAIM_POLL_INTERVAL_SECS: u64 = 5;
+const CLAIM_FAILURE_BACKOFF_SECS: u64 = 30;
+const CLAIM_SUCCESS_SUPPRESSION_SECS: u64 = 90;
+const CLAIM_MIN_AMOUNT_USDC: f64 = 0.0;
+const PERF_WINDOW_SAMPLES: usize = 240;
+const PERF_LOG_INTERVAL_SECS: u64 = 60;
+const WS_AGE_SAMPLE_INTERVAL_MS: u64 = 250;
 
 pub struct MarketMonitor {
     config: Arc<Config>,
@@ -80,6 +86,7 @@ pub struct MarketMonitor {
     last_merge_attempt: Option<Instant>,
     last_claim_poll: Option<Instant>,
     last_market_discovery_attempt: Option<Instant>,
+    force_claim_scan: bool,
 
     // Last time we checked for opportunity
     last_check: Option<Instant>,
@@ -97,6 +104,18 @@ pub struct MarketMonitor {
     last_balance_refresh: Instant,
     last_data_source: String,
     cached_fee_rate_bps: u64,
+    last_tick_signature: Option<String>,
+    ws_yes_age_ms: Option<u64>,
+    ws_no_age_ms: Option<u64>,
+    ws_reconnect_requested: bool,
+    ws_stale_warned: bool,
+    last_ws_age_sample: Option<Instant>,
+    claim_retry_after: HashMap<String, Instant>,
+    claim_success_suppression_until: HashMap<String, Instant>,
+    check_latency_ms: VecDeque<u64>,
+    claim_latency_ms: VecDeque<u64>,
+    balance_latency_ms: VecDeque<u64>,
+    perf_last_log: Instant,
 }
 
 impl MarketMonitor {
@@ -134,6 +153,7 @@ impl MarketMonitor {
             last_merge_attempt: None,
             last_claim_poll: None,
             last_market_discovery_attempt: None,
+            force_claim_scan: false,
             last_check: None,
             errors: Vec::new(),
             is_redeeming: Arc::new(AtomicBool::new(false)),
@@ -142,6 +162,18 @@ impl MarketMonitor {
             last_balance: None,
             last_balance_refresh: Instant::now(),
             last_data_source: "REST".to_string(),
+            last_tick_signature: None,
+            ws_yes_age_ms: None,
+            ws_no_age_ms: None,
+            ws_reconnect_requested: false,
+            ws_stale_warned: false,
+            last_ws_age_sample: None,
+            claim_retry_after: HashMap::new(),
+            claim_success_suppression_until: HashMap::new(),
+            check_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
+            claim_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
+            balance_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
+            perf_last_log: Instant::now(),
         })
     }
 
@@ -211,7 +243,7 @@ impl MarketMonitor {
 
         // 7. Ensure CTF approvals for Gnosis Safe (SIGNATURE_TYPE=2)
         if self.config.uses_proxy() && !self.config.mock_currency {
-            let rpc = "https://polygon-rpc.com";
+            let rpc = crate::clob_client::POLYGON_RPCS[0];
             if let Err(e) = self.client.ensure_ctf_approvals(rpc).await {
                 warn!("CTF approval check failed (continuing): {e}");
             }
@@ -349,6 +381,11 @@ impl MarketMonitor {
 
         self.ws_client = None;
         self.ws_notify = None;
+        self.ws_yes_age_ms = None;
+        self.ws_no_age_ms = None;
+        self.ws_reconnect_requested = false;
+        self.ws_stale_warned = false;
+        self.last_ws_age_sample = None;
 
         match WsClient::connect(
             token_ids,
@@ -393,7 +430,6 @@ impl MarketMonitor {
 
         // Process any incoming User WS events
         self.process_user_events().await;
-        self.maybe_redeem_resolved_positions(false).await;
 
         // Circuit breaker check
         if let Some(until) = self.circuit_breaker_until {
@@ -405,16 +441,6 @@ impl MarketMonitor {
             self.log_action("⚡ Circuit breaker expired, resuming").await;
         }
 
-        // Refresh balance periodically (every 30s) for the dashboard
-        if self.last_balance_refresh.elapsed().as_secs() >= 30 {
-            if !self.config.mock_currency {
-                if let Ok(bal) = self.client.get_balance().await {
-                    self.last_balance = Some(bal);
-                }
-            }
-            self.last_balance_refresh = Instant::now();
-        }
-
         let mi = match self.market_info.clone() {
             Some(m) => m,
             None => {
@@ -424,17 +450,14 @@ impl MarketMonitor {
             }
         };
 
+        self.sample_ws_age_if_due(&mi).await;
+
         // Market expiry check (stop new arbs 10s before expiry)
         let now_utc = Utc::now();
         let secs_to_expiry = (mi.end_date - now_utc).num_seconds();
         if secs_to_expiry <= EXPIRY_BUFFER_SECS {
             self.handle_market_rollover().await;
             return;
-        }
-
-        // Refresh gas cache if stale
-        if self.gas_cache.is_stale() {
-            self.refresh_gas_cache().await;
         }
 
         // Fetch orderbooks
@@ -475,20 +498,29 @@ impl MarketMonitor {
 
             let yes_liq = yes_book.best_ask_size().floor() as i64;
             let no_liq = no_book.best_ask_size().floor() as i64;
+            let tick_signature = format!("{yes_ask:.6}|{yes_liq}|{no_ask:.6}|{no_liq}");
 
-            let cost_color = if total_cost < effective_threshold {
-                "\x1b[32m" // green
-            } else {
-                "\x1b[31m" // red
-            };
-            let reset = "\x1b[0m";
+            if self
+                .last_tick_signature
+                .as_ref()
+                .map(|s| s != &tick_signature)
+                .unwrap_or(true)
+            {
+                let cost_color = if total_cost < effective_threshold {
+                    "\x1b[32m" // green
+                } else {
+                    "\x1b[31m" // red
+                };
+                let reset = "\x1b[0m";
 
-            let tick = format!(
-                "[{}] Up: {:.2} (x{}) | Down: {:.2} (x{}) | SUM: {}{:.3}{} (net: {:.3})",
-                now_str, yes_ask, yes_liq, no_ask, no_liq,
-                cost_color, total_cost, reset, net_spread
-            );
-            self.dashboard.add_tick(tick);
+                let tick = format!(
+                    "[{}] Up: {:.2} (x{}) | Down: {:.2} (x{}) | SUM: {}{:.3}{} (net: {:.3})",
+                    now_str, yes_ask, yes_liq, no_ask, no_liq,
+                    cost_color, total_cost, reset, net_spread
+                );
+                self.dashboard.add_tick(tick);
+                self.last_tick_signature = Some(tick_signature);
+            }
         }
 
         // Handle position imbalance first
@@ -622,7 +654,15 @@ impl MarketMonitor {
         let balance = if self.config.mock_currency {
             1000.0
         } else {
-            self.client.get_balance().await.unwrap_or(0.0)
+            self.last_balance
+                .or_else(|| {
+                    if self.session_start_balance > 0.0 {
+                        Some(self.session_start_balance)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0.0)
         };
 
         let balance_size = balance / (yes_ask + no_ask);
@@ -680,9 +720,8 @@ impl MarketMonitor {
         self.log_action("⚡️ Executing Arbitrage Orders...").await;
 
         let mut user_balance = self.last_balance.unwrap_or(0.0);
-        if user_balance == 0.0 && !self.config.mock_currency {
-            user_balance = self.client.get_balance().await.unwrap_or(0.0);
-            self.last_balance = Some(user_balance);
+        if user_balance == 0.0 && self.config.mock_currency {
+            user_balance = 1000.0;
         }
         self.log_action(&format!("💰 Balance: ${:.2} USDC", user_balance)).await;
 
@@ -1216,7 +1255,7 @@ impl MarketMonitor {
         // transaction reverts.  Check actual on-chain balances first; if zero,
         // defer and retry in MERGE_RETRY_SECS without touching in-memory state.
         if !self.config.mock_currency {
-            let rpc = "https://polygon-rpc.com";
+            let rpc = crate::clob_client::POLYGON_RPCS[0];
             let holder = self.client.maker_address();
             let yes_on_chain = self
                 .client
@@ -1263,15 +1302,8 @@ impl MarketMonitor {
         let _locked_ref = self.session_locked_value; // snapshot — background task won't mutate shared state
 
         tokio::spawn(async move {
-            // Try Polygon RPC providers in order
-            let rpcs = [
-                "https://polygon-rpc.com",
-                "https://polygon.llamarpc.com",
-                "https://rpc.ankr.com/polygon",
-            ];
-
             let mut last_err = None;
-            for rpc in &rpcs {
+            for rpc in &crate::clob_client::POLYGON_RPCS {
                 match client
                     .merge_positions(&condition_id, capped, neg_risk, rpc)
                     .await
@@ -1316,110 +1348,149 @@ impl MarketMonitor {
 
     // ─── Redemption ────────────────────────────────────────────────────────────
 
-    /// Redeem winnings from resolved markets.
-    /// Replicates TypeScript `redeemResolvedPositions()`.
-    pub async fn redeem_resolved_positions(&mut self) {
-        if self.config.mock_currency {
-            return;
-        }
+    pub async fn run_claim_cycle(monitor: &Arc<Mutex<Self>>) {
+        let cycle_start = Instant::now();
+        let now = Instant::now();
 
-        // Prevent concurrent redemptions
-        if self.is_redeeming.load(Ordering::Relaxed) {
-            debug!("Redemption already in progress — skipping");
-            return;
-        }
+        let (client, should_scan) = {
+            let mut m = monitor.lock().await;
 
-        // Augment active_assets from historical trades
-        let holder = self.client.maker_address();
-        if let Ok(trades) = self.client.get_trades(None).await {
-            for trade in trades {
-                self.active_assets.insert(trade.token_id);
+            if m.config.mock_currency {
+                m.record_claim_latency(cycle_start.elapsed());
+                return;
             }
-        }
-
-        if self.active_assets.is_empty() {
-            return;
-        }
-
-        let rpcs = [
-            "https://polygon-rpc.com",
-            "https://polygon.llamarpc.com",
-            "https://rpc.ankr.com/polygon",
-        ];
-        let rpc = rpcs[0];
-
-        let mut to_remove = Vec::new();
-        let mut redeemable_conditions = std::collections::HashSet::new();
-
-        self.pending_claim_value = 0.0;
-
-        for token_id in self.active_assets.clone() {
-            // 1. Check on-chain balance
-            let balance = self.client.get_ctf_balance(&token_id, holder, rpc).await.unwrap_or(0.0);
-            
-            if balance < 0.01 {
-                to_remove.push(token_id);
-                continue;
+            if m.is_redeeming.load(Ordering::Relaxed) {
+                m.record_claim_latency(cycle_start.elapsed());
+                return;
             }
 
-            // 2. Query Gamma API
-            let url = format!("https://gamma-api.polymarket.com/markets?clob_token_ids={}", token_id);
-            let client = reqwest::Client::new();
-            if let Ok(resp) = client.get(&url).send().await {
-                if let Ok(markets) = resp.json::<Vec<GammaMarket>>().await {
-                    for market in markets {
-                        if market.closed.unwrap_or(false) && !market.condition_id.is_empty() {
-                            if !redeemable_conditions.contains(&market.condition_id) {
-                                redeemable_conditions.insert(market.condition_id.clone());
-                                
-                                self.pending_claim_value += balance;
-                                info!("Redeeming {}: pool={:.2}", market.condition_id, balance);
+            let due = m
+                .last_claim_poll
+                .map(|t| t.elapsed().as_secs() >= CLAIM_POLL_INTERVAL_SECS)
+                .unwrap_or(true);
+            if !due && !m.force_claim_scan {
+                m.record_claim_latency(cycle_start.elapsed());
+                return;
+            }
+            m.last_claim_poll = Some(now);
+            m.force_claim_scan = false;
+            (Arc::clone(&m.client), true)
+        };
 
-                                let cid = market.condition_id.clone();
-                                let question = market.question.clone();
-                                let is_redeeming_flag = Arc::clone(&self.is_redeeming);
-                                let cl = Arc::clone(&self.client);
+        if !should_scan {
+            return;
+        }
 
-                                is_redeeming_flag.store(true, Ordering::Relaxed);
+        let redeemables = match client.get_redeemable_conditions().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to fetch redeemable positions: {e}");
+                let mut m = monitor.lock().await;
+                m.record_claim_latency(cycle_start.elapsed());
+                return;
+            }
+        };
 
-                                tokio::spawn(async move {
-                                    for r in &rpcs {
-                                        match cl.redeem_positions(&cid, r).await {
-                                            Ok(tx) => {
-                                                info!("Redemption confirmed: {:.2} | tx={tx:?}", balance);
-                                                if let Ok(logger) = crate::trade_logger::TradeLogger::new().await {
-                                                    logger.log_redemption(&cid, Some(&question), balance, balance, true, None).await;
-                                                }
-                                                is_redeeming_flag.store(false, Ordering::Relaxed);
-                                                return;
-                                            }
-                                            Err(e) => warn!("Redemption failed on {r}: {e}"),
-                                        }
-                                    }
-                                    is_redeeming_flag.store(false, Ordering::Relaxed);
-                                });
-                            }
-                        }
+        let total_claimable = redeemables.iter().map(|x| x.2).sum::<f64>();
+        let candidates = {
+            let mut m = monitor.lock().await;
+            m.pending_claim_value = total_claimable;
+            if redeemables.is_empty() {
+                m.record_claim_latency(cycle_start.elapsed());
+                return;
+            }
+
+            let now = Instant::now();
+            let mut picked = Vec::new();
+            for (cid, question, amount) in redeemables {
+                if !m.should_attempt_claim(&cid, amount, now) {
+                    continue;
+                }
+                picked.push((cid, question, amount));
+            }
+
+            if picked.is_empty() {
+                m.record_claim_latency(cycle_start.elapsed());
+                return;
+            }
+
+            m.is_redeeming.store(true, Ordering::Relaxed);
+            m.log_action(&format!(
+                "💸 Claimable detected: ${:.2} total — processing {} condition(s)",
+                total_claimable,
+                picked.len()
+            ))
+            .await;
+            picked
+        };
+
+        for (cid, question, amount) in candidates {
+            {
+                let mut m = monitor.lock().await;
+                m.log_action(&format!(
+                    "💸 Claim attempt: {} (${:.2})",
+                    question, amount
+                ))
+                .await;
+            }
+
+            let mut success_tx: Option<String> = None;
+            let mut last_error = String::from("unknown redeem error");
+
+            for rpc in &crate::clob_client::POLYGON_RPCS {
+                match client.redeem_positions(&cid, rpc).await {
+                    Ok(tx) => {
+                        success_tx = Some(format!("{tx:?}"));
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = format!("{e}");
+                        warn!("Redemption failed on {rpc}: {e}");
                     }
                 }
             }
-        }
 
-        for token in to_remove {
-            self.active_assets.remove(&token);
-        }
-    }
-
-    async fn maybe_redeem_resolved_positions(&mut self, force: bool) {
-        if !force {
-            if let Some(last_poll) = self.last_claim_poll {
-                if last_poll.elapsed().as_secs() < CLAIM_POLL_INTERVAL_SECS {
-                    return;
-                }
+            let mut m = monitor.lock().await;
+            if let Some(tx_hash) = success_tx {
+                m.claim_retry_after.remove(&cid);
+                m.claim_success_suppression_until.insert(
+                    cid.clone(),
+                    Instant::now() + Duration::from_secs(CLAIM_SUCCESS_SUPPRESSION_SECS),
+                );
+                m.log_action(&format!(
+                    "✅ Redemption confirmed: {} (${:.2}) tx={}",
+                    question, amount, tx_hash
+                ))
+                .await;
+                m.trade_logger
+                    .log_redemption(&cid, Some(&question), amount, amount, true, None)
+                    .await;
+            } else {
+                m.claim_retry_after.insert(
+                    cid.clone(),
+                    Instant::now() + Duration::from_secs(CLAIM_FAILURE_BACKOFF_SECS),
+                );
+                m.log_action(&format!(
+                    "⚠️ Redemption failed: {} (${:.2}) — retry in {}s",
+                    question, amount, CLAIM_FAILURE_BACKOFF_SECS
+                ))
+                .await;
+                m.trade_logger
+                    .log_redemption(
+                        &cid,
+                        Some(&question),
+                        amount,
+                        amount,
+                        false,
+                        Some(last_error),
+                    )
+                    .await;
             }
         }
-        self.last_claim_poll = Some(Instant::now());
-        self.redeem_resolved_positions().await;
+
+        let mut m = monitor.lock().await;
+        m.is_redeeming.store(false, Ordering::Relaxed);
+        m.record_claim_latency(cycle_start.elapsed());
     }
 
     // ─── Market Rollover ───────────────────────────────────────────────────────
@@ -1447,6 +1518,9 @@ impl MarketMonitor {
         self.market_info = None;
         self.ws_client = None;
         self.ws_notify = None;
+        self.last_tick_signature = None;
+        self.ws_yes_age_ms = None;
+        self.ws_no_age_ms = None;
         self.last_market_discovery_attempt = Some(Instant::now());
 
         // Find next market (non-fatal if unavailable during a short gap)
@@ -1544,7 +1618,6 @@ impl MarketMonitor {
 
     async fn process_user_events(&mut self) {
         let mut ws_client_opt = self.ws_client.take();
-        let mut force_claim_scan = false;
         if let Some(ref mut ws) = ws_client_opt {
             while let Ok(msg) = ws.user_events_rx.try_recv() {
                 // Peek the event_type
@@ -1592,9 +1665,7 @@ impl MarketMonitor {
                                 for token_id in &ev.asset_ids {
                                     self.active_assets.insert(token_id.clone());
                                 }
-                                self.last_balance_refresh =
-                                    Instant::now() - Duration::from_secs(30);
-                                force_claim_scan = true;
+                                self.force_claim_scan = true;
                                 let q = ev
                                     .question
                                     .clone()
@@ -1612,10 +1683,6 @@ impl MarketMonitor {
             }
         }
         self.ws_client = ws_client_opt;
-
-        if force_claim_scan {
-            self.maybe_redeem_resolved_positions(true).await;
-        }
     }
 
     // ─── WS Health Check ──────────────────────────────────────────────────────
@@ -1631,13 +1698,17 @@ impl MarketMonitor {
         };
 
         let healthy = if let Some(ref ws) = self.ws_client {
+            let yes_age = ws.get_book_age_ms(&mi.tokens.yes).await;
+            let no_age = ws.get_book_age_ms(&mi.tokens.no).await;
+            self.ws_yes_age_ms = yes_age;
+            self.ws_no_age_ms = no_age;
             ws.is_healthy(&mi.tokens.yes).await && ws.is_healthy(&mi.tokens.no).await
         } else {
             false
         };
 
-        if !healthy {
-            warn!("WS unhealthy — reconnecting");
+        if !healthy || self.ws_reconnect_requested {
+            warn!("WS unhealthy/stale — reconnecting");
             let token_ids = vec![mi.tokens.yes.clone(), mi.tokens.no.clone()];
             match WsClient::connect(
                 token_ids,
@@ -1648,6 +1719,9 @@ impl MarketMonitor {
                 Ok((ws, notify)) => {
                     self.ws_client = Some(ws);
                     self.ws_notify = Some(notify);
+                    self.ws_reconnect_requested = false;
+                    self.ws_stale_warned = false;
+                    self.last_ws_age_sample = None;
                     info!("WS reconnected");
                     self.log_action("📡 WebSocket orderbook feed reconnected").await;
                 }
@@ -1658,7 +1732,186 @@ impl MarketMonitor {
         }
     }
 
+    pub async fn run_balance_refresh_cycle(monitor: &Arc<Mutex<Self>>) {
+        let cycle_start = Instant::now();
+        let (is_mock, client) = {
+            let m = monitor.lock().await;
+            (m.config.mock_currency, Arc::clone(&m.client))
+        };
+
+        let fetch = if is_mock {
+            Ok(1000.0)
+        } else {
+            client.get_balance().await
+        };
+
+        let mut m = monitor.lock().await;
+        match fetch {
+            Ok(balance) => {
+                m.last_balance = Some(balance);
+                m.last_balance_refresh = Instant::now();
+            }
+            Err(e) => {
+                warn!("Balance refresh cycle failed: {e}");
+            }
+        }
+        m.record_balance_latency(cycle_start.elapsed());
+    }
+
+    pub async fn run_gas_refresh_cycle(monitor: &Arc<Mutex<Self>>) {
+        let (client, enabled) = {
+            let m = monitor.lock().await;
+            (Arc::clone(&m.client), !m.config.mock_currency)
+        };
+        if !enabled {
+            return;
+        }
+
+        let (gas_gwei, pol_price) = tokio::join!(client.get_gas_price_gwei(), client.get_pol_price_usd());
+        let merge_gas = 300_000_u64;
+        let fee_per_merge_usd = (gas_gwei * 1e-9 * merge_gas as f64) * pol_price;
+
+        let mut m = monitor.lock().await;
+        m.gas_cache = GasCache {
+            gas_price_gwei: gas_gwei,
+            pol_price_usd: pol_price,
+            fee_per_merge_usd,
+            updated_at: Instant::now(),
+        };
+        debug!(
+            "Gas cache cycle: {gas_gwei:.1} Gwei, POL=${pol_price:.4}, merge≈${fee_per_merge_usd:.5}"
+        );
+    }
+
     // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    async fn sample_ws_age_if_due(&mut self, mi: &MarketInfo) {
+        let due = self
+            .last_ws_age_sample
+            .map(|t| t.elapsed() >= Duration::from_millis(WS_AGE_SAMPLE_INTERVAL_MS))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_ws_age_sample = Some(Instant::now());
+
+        let Some(ws) = self.ws_client.as_ref() else {
+            self.ws_yes_age_ms = None;
+            self.ws_no_age_ms = None;
+            return;
+        };
+
+        let yes_age = ws.get_book_age_ms(&mi.tokens.yes).await;
+        let no_age = ws.get_book_age_ms(&mi.tokens.no).await;
+        self.ws_yes_age_ms = yes_age;
+        self.ws_no_age_ms = no_age;
+
+        let stale = Self::ws_ages_stale(yes_age, no_age);
+
+        if stale {
+            self.ws_reconnect_requested = true;
+            if !self.ws_stale_warned {
+                self.ws_stale_warned = true;
+                self.log_action("⚠️ WS stale feed detected — requesting reconnect")
+                    .await;
+            }
+        } else {
+            self.ws_stale_warned = false;
+        }
+    }
+
+    fn should_attempt_claim(&self, condition_id: &str, amount: f64, now: Instant) -> bool {
+        if amount < CLAIM_MIN_AMOUNT_USDC {
+            return false;
+        }
+        if self
+            .claim_success_suppression_until
+            .get(condition_id)
+            .map(|until| now < *until)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if self
+            .claim_retry_after
+            .get(condition_id)
+            .map(|until| now < *until)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn ws_ages_stale(yes_age_ms: Option<u64>, no_age_ms: Option<u64>) -> bool {
+        let threshold = crate::ws_client::BOOK_STALE_THRESHOLD_MS;
+        yes_age_ms.map(|v| v > threshold).unwrap_or(true)
+            || no_age_ms.map(|v| v > threshold).unwrap_or(true)
+    }
+
+    fn record_check_latency(&mut self, elapsed: Duration) {
+        Self::push_latency_sample(&mut self.check_latency_ms, elapsed);
+        self.maybe_log_latency_summary();
+    }
+
+    fn record_claim_latency(&mut self, elapsed: Duration) {
+        Self::push_latency_sample(&mut self.claim_latency_ms, elapsed);
+        self.maybe_log_latency_summary();
+    }
+
+    fn record_balance_latency(&mut self, elapsed: Duration) {
+        Self::push_latency_sample(&mut self.balance_latency_ms, elapsed);
+        self.maybe_log_latency_summary();
+    }
+
+    fn push_latency_sample(samples: &mut VecDeque<u64>, elapsed: Duration) {
+        let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        samples.push_back(ms);
+        while samples.len() > PERF_WINDOW_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    fn percentile(samples: &VecDeque<u64>, pct: f64) -> Option<u64> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<u64> = samples.iter().copied().collect();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
+        sorted.get(idx).copied()
+    }
+
+    fn maybe_log_latency_summary(&mut self) {
+        if self.perf_last_log.elapsed().as_secs() < PERF_LOG_INTERVAL_SECS {
+            return;
+        }
+        self.perf_last_log = Instant::now();
+
+        let check_p50 = Self::percentile(&self.check_latency_ms, 0.50).unwrap_or(0);
+        let check_p95 = Self::percentile(&self.check_latency_ms, 0.95).unwrap_or(0);
+        let claim_p50 = Self::percentile(&self.claim_latency_ms, 0.50).unwrap_or(0);
+        let claim_p95 = Self::percentile(&self.claim_latency_ms, 0.95).unwrap_or(0);
+        let balance_p50 = Self::percentile(&self.balance_latency_ms, 0.50).unwrap_or(0);
+        let balance_p95 = Self::percentile(&self.balance_latency_ms, 0.95).unwrap_or(0);
+
+        info!(
+            "Perf latency (ms) | check p50/p95={}/{} n={} | claim p50/p95={}/{} n={} | balance p50/p95={}/{} n={}",
+            check_p50,
+            check_p95,
+            self.check_latency_ms.len(),
+            claim_p50,
+            claim_p95,
+            self.claim_latency_ms.len(),
+            balance_p50,
+            balance_p95,
+            self.balance_latency_ms.len()
+        );
+    }
+
+    pub fn record_check_latency_sample(&mut self, elapsed: Duration) {
+        self.record_check_latency(elapsed);
+    }
 
     pub async fn log_action(&mut self, msg: &str) {
         self.dashboard.log_action(msg);
@@ -1721,6 +1974,8 @@ impl MarketMonitor {
             circuit_breaker_remaining_secs: cb_remaining,
             data_source: &self.last_data_source,
             pending_claim_usdc: Some(self.pending_claim_value),
+            ws_yes_age_ms: self.ws_yes_age_ms,
+            ws_no_age_ms: self.ws_no_age_ms,
         };
 
         self.dashboard.render(&state);
@@ -1809,6 +2064,7 @@ mod tests {
             last_merge_attempt: None,
             last_claim_poll: None,
             last_market_discovery_attempt: None,
+            force_claim_scan: false,
             last_check: None,
             errors: Vec::new(),
             is_redeeming: Arc::new(AtomicBool::new(false)),
@@ -1818,6 +2074,18 @@ mod tests {
             last_balance_refresh: Instant::now(),
             last_data_source: "REST".to_string(),
             cached_fee_rate_bps: 100, // 1% basis points
+            last_tick_signature: None,
+            ws_yes_age_ms: None,
+            ws_no_age_ms: None,
+            ws_reconnect_requested: false,
+            ws_stale_warned: false,
+            last_ws_age_sample: None,
+            claim_retry_after: HashMap::new(),
+            claim_success_suppression_until: HashMap::new(),
+            check_latency_ms: VecDeque::new(),
+            claim_latency_ms: VecDeque::new(),
+            balance_latency_ms: VecDeque::new(),
+            perf_last_log: Instant::now(),
         })
     }
 
@@ -1883,5 +2151,37 @@ mod tests {
 
         let size = monitor.calculate_size(&yes_book, &no_book, 0.40, 0.58).await;
         assert_eq!(size, 1020.0); // Floored
+    }
+
+    #[tokio::test]
+    async fn test_claim_candidate_blocked_by_retry_and_suppression() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        let now = Instant::now();
+        let cid = "0xabc".to_string();
+
+        monitor
+            .claim_retry_after
+            .insert(cid.clone(), now + Duration::from_secs(30));
+        assert!(!monitor.should_attempt_claim(&cid, 1.0, now));
+
+        monitor.claim_retry_after.clear();
+        monitor
+            .claim_success_suppression_until
+            .insert(cid.clone(), now + Duration::from_secs(90));
+        assert!(!monitor.should_attempt_claim(&cid, 1.0, now));
+
+        monitor.claim_success_suppression_until.clear();
+        assert!(monitor.should_attempt_claim(&cid, 1.0, now));
+    }
+
+    #[test]
+    fn test_ws_stale_detection() {
+        let threshold = crate::ws_client::BOOK_STALE_THRESHOLD_MS;
+        assert!(MarketMonitor::ws_ages_stale(None, Some(10)));
+        assert!(MarketMonitor::ws_ages_stale(Some(threshold + 1), Some(10)));
+        assert!(MarketMonitor::ws_ages_stale(Some(10), Some(threshold + 1)));
+        assert!(!MarketMonitor::ws_ages_stale(Some(10), Some(10)));
     }
 }

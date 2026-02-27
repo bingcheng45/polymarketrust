@@ -47,6 +47,8 @@ pub struct DashboardState<'a> {
 
     // Data source
     pub data_source: &'a str, // "WS" or "REST"
+    pub ws_yes_age_ms: Option<u64>,
+    pub ws_no_age_ms: Option<u64>,
 }
 
 /// The dashboard state machine.
@@ -257,6 +259,12 @@ impl Dashboard {
             "📈 LIVE MARKET DATA ({}) (Last {} ticks)\n",
             state.data_source, MAX_PRICE_TICKS
         ));
+        if let (Some(yes_age), Some(no_age)) = (state.ws_yes_age_ms, state.ws_no_age_ms) {
+            out.push_str(&format!(
+                "   WS age: Up={}ms | Down={}ms\n",
+                yes_age, no_age
+            ));
+        }
         if self.price_buffer.is_empty() {
             out.push_str("   (Waiting for ticks...)\n");
         } else {

@@ -97,6 +97,9 @@ async fn main() -> Result<()> {
     let monitor_arb = Arc::clone(&monitor);
     let monitor_maker = Arc::clone(&monitor);
     let monitor_ws = Arc::clone(&monitor);
+    let monitor_balance = Arc::clone(&monitor);
+    let monitor_gas = Arc::clone(&monitor);
+    let monitor_claim = Arc::clone(&monitor);
 
     // 1. Opportunity check — WS-driven (event-based with 20ms throttle) with 5s REST heartbeat fallback
     //    Mirrors TypeScript bot: fires checkOpportunity() instantly on WS book updates.
@@ -118,19 +121,25 @@ async fn main() -> Result<()> {
                         if now.duration_since(last_check) >= WS_THROTTLE {
                             last_check = now;
                             let mut m = monitor_arb.lock().await;
+                            let started = std::time::Instant::now();
                             m.check_opportunity().await;
+                            m.record_check_latency_sample(started.elapsed());
                         }
                     }
                     _ = tokio::time::sleep(REST_HEARTBEAT) => {
                         // 5s Heartbeat when WS is connected but silent
                         let mut m = monitor_arb.lock().await;
+                        let started = std::time::Instant::now();
                         m.check_opportunity().await;
+                        m.record_check_latency_sample(started.elapsed());
                     }
                 }
             } else {
                 // Fully disconnected fallback: poll every 1s
                 let mut m = monitor_arb.lock().await;
+                let started = std::time::Instant::now();
                 m.check_opportunity().await;
+                m.record_check_latency_sample(started.elapsed());
                 drop(m);
                 tokio::time::sleep(REST_FALLBACK).await;
             }
@@ -147,13 +156,40 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 3. WS health check every 30 seconds
+    // 3. WS health check every 5 seconds
     let ws_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
             let mut m = monitor_ws.lock().await;
             m.check_ws_health().await;
+        }
+    });
+
+    // 4. Balance refresh worker (every 2 seconds, outside strategy hot path)
+    let balance_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            MarketMonitor::run_balance_refresh_cycle(&monitor_balance).await;
+        }
+    });
+
+    // 5. Gas refresh worker (every 30 seconds, outside strategy hot path)
+    let gas_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            MarketMonitor::run_gas_refresh_cycle(&monitor_gas).await;
+        }
+    });
+
+    // 6. Claim refresh worker (every 5 seconds, outside strategy hot path)
+    let claim_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            MarketMonitor::run_claim_cycle(&monitor_claim).await;
         }
     });
 
@@ -165,6 +201,9 @@ async fn main() -> Result<()> {
     arb_handle.abort();
     maker_handle.abort();
     ws_handle.abort();
+    balance_handle.abort();
+    gas_handle.abort();
+    claim_handle.abort();
 
     // Graceful shutdown
     {

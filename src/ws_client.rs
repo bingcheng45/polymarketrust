@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 /// If no WS update arrives for this long, we temporarily allow REST fallback.
 /// Keep this comfortably above normal burst gaps to avoid unnecessary REST polling.
-const BOOK_STALE_THRESHOLD_MS: u64 = 60_000;
+pub const BOOK_STALE_THRESHOLD_MS: u64 = 60_000;
 
 struct BookEntry {
     book: OrderBook,
@@ -167,8 +167,7 @@ async fn ws_market_loop(
                         if !active_tokens.is_empty() {
                             let _ = client.unsubscribe_orderbook(&active_tokens);
                             let _ = client.unsubscribe_prices(&active_tokens);
-                            // `subscribe_market_resolutions` shares the same market ref-count pool.
-                            let _ = client.unsubscribe_orderbook(&active_tokens);
+                            let _ = unsubscribe_market_resolutions(&client, &active_tokens);
                         }
                         
                         active_tokens = tokens;
@@ -269,6 +268,14 @@ fn parse_ws_token_id(token_id: &str) -> Result<U256> {
         U256::from_str_radix(token_id, 10)
             .map_err(|e| anyhow::anyhow!("invalid decimal token id: {}", e))
     }
+}
+
+fn unsubscribe_market_resolutions(
+    client: &Client,
+    asset_ids: &[U256],
+) -> std::result::Result<(), SdkError> {
+    // SDK routes market resolution subscriptions through the market ref-count pool.
+    client.unsubscribe_orderbook(asset_ids)
 }
 
 async fn handle_book_message(
