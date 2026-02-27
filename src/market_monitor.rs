@@ -51,6 +51,7 @@ const WS_AGE_SAMPLE_INTERVAL_MS: u64 = 250;
 const ORDER_STATUS_TIMEOUT_MS: u64 = 1_500;
 const SDK_CALL_TIMEOUT_MS: u64 = 1_500;
 const WS_STALE_SAMPLE_LIMIT: u8 = 2;
+const WS_STALE_GRACE_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Default)]
 struct PostedOrderIds {
@@ -122,6 +123,7 @@ pub struct MarketMonitor {
     ws_reconnect_requested: bool,
     ws_stale_warned: bool,
     ws_stale_consecutive: u8,
+    ws_connected_at: Option<Instant>,
     last_ws_age_sample: Option<Instant>,
     claim_retry_after: HashMap<String, Instant>,
     claim_success_suppression_until: HashMap<String, Instant>,
@@ -130,6 +132,12 @@ pub struct MarketMonitor {
     balance_latency_ms: VecDeque<u64>,
     lock_wait_latency_ms: VecDeque<u64>,
     render_latency_ms: VecDeque<u64>,
+    checks_total: u64,
+    checks_fee_qualified: u64,
+    checks_skipped_extreme: u64,
+    checks_skipped_size: u64,
+    checks_skipped_profit: u64,
+    checks_executed: u64,
     perf_last_log: Instant,
     render_requested: bool,
 }
@@ -188,6 +196,7 @@ impl MarketMonitor {
             ws_reconnect_requested: false,
             ws_stale_warned: false,
             ws_stale_consecutive: 0,
+            ws_connected_at: None,
             last_ws_age_sample: None,
             claim_retry_after: HashMap::new(),
             claim_success_suppression_until: HashMap::new(),
@@ -196,6 +205,12 @@ impl MarketMonitor {
             balance_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
             lock_wait_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
             render_latency_ms: VecDeque::with_capacity(PERF_WINDOW_SAMPLES + 1),
+            checks_total: 0,
+            checks_fee_qualified: 0,
+            checks_skipped_extreme: 0,
+            checks_skipped_size: 0,
+            checks_skipped_profit: 0,
+            checks_executed: 0,
             perf_last_log: Instant::now(),
             render_requested: true,
         })
@@ -410,6 +425,7 @@ impl MarketMonitor {
         self.ws_reconnect_requested = false;
         self.ws_stale_warned = false;
         self.ws_stale_consecutive = 0;
+        self.ws_connected_at = None;
         self.last_ws_age_sample = None;
 
         match WsClient::connect(
@@ -423,6 +439,7 @@ impl MarketMonitor {
             Ok((ws, notify)) => {
                 self.ws_client = Some(ws);
                 self.ws_notify = Some(notify);
+                self.ws_connected_at = Some(Instant::now());
                 info!("WS client connected");
                 self.log_action("📡 WebSocket orderbook feed connected").await;
             }
@@ -508,6 +525,7 @@ impl MarketMonitor {
                 return;
             }
         };
+        self.checks_total = self.checks_total.saturating_add(1);
 
         let total_cost = yes_ask + no_ask;
         let active_fee_rate = if self.cached_fee_rate_bps > 0 { self.config.clob_fee_rate } else { 0.0 };
@@ -566,9 +584,11 @@ impl MarketMonitor {
         }
 
         if total_cost < effective_threshold {
+            self.checks_fee_qualified = self.checks_fee_qualified.saturating_add(1);
             let max_leg_price = 1.0 - self.config.min_leg_price;
             if yes_ask < self.config.min_leg_price || yes_ask > max_leg_price ||
                 no_ask < self.config.min_leg_price || no_ask > max_leg_price {
+                self.checks_skipped_extreme = self.checks_skipped_extreme.saturating_add(1);
                 self.log_action(&format!(
                     "⏭  Extreme prices skipped: UP@{:.2}, DOWN@{:.2} — near-zero liquidity on cheap leg (min: {})",
                     yes_ask, no_ask, self.config.min_leg_price
@@ -602,6 +622,7 @@ impl MarketMonitor {
         // Calculate trade size
         let size = self.calculate_size(&yes_book, &no_book, yes_ask, no_ask).await;
         if size < 1.0 {
+            self.checks_skipped_size = self.checks_skipped_size.saturating_add(1);
             self.request_render();
             return;
         }
@@ -618,6 +639,7 @@ impl MarketMonitor {
         let expected_profit = actual_payout_size * 1.0 - total_cost * size - gas_estimate;
 
         if expected_profit < self.config.min_net_profit_usd {
+            self.checks_skipped_profit = self.checks_skipped_profit.saturating_add(1);
             self.request_render();
             return;
         }
@@ -631,6 +653,7 @@ impl MarketMonitor {
             spread: net_spread,
         };
 
+        self.checks_executed = self.checks_executed.saturating_add(1);
         self.execute_arb(opportunity, &mi, size).await;
 
         self.request_render();
@@ -1766,18 +1789,17 @@ impl MarketMonitor {
             None => return,
         };
 
-        let healthy = if let Some(ref ws) = self.ws_client {
+        if let Some(ref ws) = self.ws_client {
             let yes_age = ws.get_book_age_ms(&mi.tokens.yes).await;
             let no_age = ws.get_book_age_ms(&mi.tokens.no).await;
             self.ws_yes_age_ms = yes_age;
             self.ws_no_age_ms = no_age;
-            ws.is_healthy(&mi.tokens.yes).await && ws.is_healthy(&mi.tokens.no).await
-        } else {
-            false
-        };
+        }
 
-        if !healthy || self.ws_reconnect_requested {
-            warn!("WS unhealthy/stale — reconnecting");
+        // Align with TS behavior: reconnect on explicit reconnect request or missing WS client.
+        // Staleness is handled by REST fallback in the hot path and should not force reconnect loops.
+        if self.ws_client.is_none() || self.ws_reconnect_requested {
+            warn!("WS connection missing/reconnect requested — reconnecting");
             let token_ids = vec![mi.tokens.yes.clone(), mi.tokens.no.clone()];
             match WsClient::connect(
                 token_ids,
@@ -1791,6 +1813,7 @@ impl MarketMonitor {
                     self.ws_reconnect_requested = false;
                     self.ws_stale_warned = false;
                     self.ws_stale_consecutive = 0;
+                    self.ws_connected_at = Some(Instant::now());
                     self.last_ws_age_sample = None;
                     info!("WS reconnected");
                     self.log_action("📡 WebSocket orderbook feed reconnected").await;
@@ -1963,16 +1986,25 @@ impl MarketMonitor {
         self.ws_yes_age_ms = yes_age;
         self.ws_no_age_ms = no_age;
 
+        // Mirror TS behavior: don't treat a fresh WS reconnect as stale immediately.
+        // First snapshot/delta can arrive a bit late around rollover windows.
+        let within_grace = self
+            .ws_connected_at
+            .map(|t| t.elapsed() < Duration::from_secs(WS_STALE_GRACE_SECS))
+            .unwrap_or(false);
+        if within_grace {
+            self.ws_stale_consecutive = 0;
+            self.ws_stale_warned = false;
+            return;
+        }
+
         let stale = Self::ws_ages_stale(yes_age, no_age);
 
         if stale {
             self.ws_stale_consecutive = self.ws_stale_consecutive.saturating_add(1);
-            if self.ws_stale_consecutive >= WS_STALE_SAMPLE_LIMIT {
-                self.ws_reconnect_requested = true;
-            }
             if self.ws_stale_consecutive >= WS_STALE_SAMPLE_LIMIT && !self.ws_stale_warned {
                 self.ws_stale_warned = true;
-                self.log_action("⚠️ WS stale feed detected — requesting reconnect")
+                self.log_action("⚠️ WS stale feed detected — using REST fallback")
                     .await;
             }
         } else {
@@ -2081,9 +2113,14 @@ impl MarketMonitor {
             .unwrap_or(0);
         let trade_q = self.trade_logger.queue_depth();
         let trade_drop = self.trade_logger.dropped_count();
+        let qual_rate = if self.checks_total > 0 {
+            (self.checks_fee_qualified as f64 / self.checks_total as f64) * 100.0
+        } else {
+            0.0
+        };
 
         info!(
-            "Perf latency (ms) | check {}/{} n={} | claim {}/{} n={} | balance {}/{} n={} | lock-wait {}/{} n={} | render {}/{} n={} | queue action/trade={}/{} dropped action/trade={}/{}",
+            "Perf latency (ms) | check {}/{} n={} | claim {}/{} n={} | balance {}/{} n={} | lock-wait {}/{} n={} | render {}/{} n={} | queue action/trade={}/{} dropped action/trade={}/{} | opp checks={} qual={} ({:.2}%) extreme={} size={} profit={} executed={}",
             check_p50,
             check_p95,
             self.check_latency_ms.len(),
@@ -2102,7 +2139,14 @@ impl MarketMonitor {
             action_q,
             trade_q,
             action_drop,
-            trade_drop
+            trade_drop,
+            self.checks_total,
+            self.checks_fee_qualified,
+            qual_rate,
+            self.checks_skipped_extreme,
+            self.checks_skipped_size,
+            self.checks_skipped_profit,
+            self.checks_executed
         );
     }
 
@@ -2307,6 +2351,7 @@ mod tests {
             ws_reconnect_requested: false,
             ws_stale_warned: false,
             ws_stale_consecutive: 0,
+            ws_connected_at: None,
             last_ws_age_sample: None,
             claim_retry_after: HashMap::new(),
             claim_success_suppression_until: HashMap::new(),
@@ -2315,6 +2360,12 @@ mod tests {
             balance_latency_ms: VecDeque::new(),
             lock_wait_latency_ms: VecDeque::new(),
             render_latency_ms: VecDeque::new(),
+            checks_total: 0,
+            checks_fee_qualified: 0,
+            checks_skipped_extreme: 0,
+            checks_skipped_size: 0,
+            checks_skipped_profit: 0,
+            checks_executed: 0,
             perf_last_log: Instant::now(),
             render_requested: true,
         })
