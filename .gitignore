@@ -6,6 +6,7 @@ Cargo.lock
 .env
 
 # Logs
+/logs/*.log
 /logs/*.txt
 /logs/*.jsonl
 /logs/*.json
