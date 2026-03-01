@@ -71,6 +71,10 @@ const MAX_WS_MARKET_EVENTS_PER_CYCLE: usize = 64;
 const MAX_SEEN_WS_TRADE_IDS: usize = 8_192;
 const MAX_RESPONSE_APPLIED_ORDER_IDS: usize = 8_192;
 const IMBALANCE_DUST_RECHECK_SECS: u64 = 20;
+const FORCE_BUY_HEDGE_WINDOW_SECS: u64 = 300;
+const RECONCILE_NONZERO_SYNC_STREAK: u32 = 3;
+const RECONCILE_ZERO_SYNC_STREAK: u32 = 6;
+const RECONCILE_ZERO_SYNC_GRACE_SECS: u64 = 180;
 
 #[derive(Debug, Clone, Default)]
 struct PostedOrderIds {
@@ -205,7 +209,9 @@ pub struct MarketMonitor {
     ws_trade_id_queue: VecDeque<String>,
     response_applied_order_ids: HashSet<String>,
     response_applied_order_queue: VecDeque<String>,
+    last_position_activity_at: Option<Instant>,
     reconcile_drift_streak: u32,
+    force_buy_hedge_until: Option<Instant>,
 }
 
 impl MarketMonitor {
@@ -303,7 +309,9 @@ impl MarketMonitor {
             ws_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
             response_applied_order_ids: HashSet::new(),
             response_applied_order_queue: VecDeque::with_capacity(MAX_RESPONSE_APPLIED_ORDER_IDS + 1),
+            last_position_activity_at: None,
             reconcile_drift_streak: 0,
+            force_buy_hedge_until: None,
         })
     }
 
@@ -404,6 +412,9 @@ impl MarketMonitor {
                         self.position.no_cost += cost;
                         self.active_assets.insert(mi.tokens.no.clone());
                     }
+                }
+                if self.position.yes_size > 0.01 || self.position.no_size > 0.01 {
+                    self.note_position_activity();
                 }
                 if self.position.yes_size > 0.01 || self.position.no_size > 0.01 {
                     info!(
@@ -1413,6 +1424,7 @@ impl MarketMonitor {
             self.position.no_size += no_filled;
             self.position.yes_cost += yes_filled * opp.yes_price;
             self.position.no_cost += no_filled * opp.no_price;
+            self.note_position_activity();
             self.active_assets.insert(mi.tokens.yes.clone());
             self.active_assets.insert(mi.tokens.no.clone());
 
@@ -1758,6 +1770,7 @@ impl MarketMonitor {
         let applied_size =
             Self::apply_position_trade_delta(size_ref, cost_ref, &side, trade_size, trade_price);
         if applied_size > 0.0 {
+            self.note_position_activity();
             self.active_assets.insert(ev.asset_id.clone());
             self.log_action_fast(&format!(
                 "⚠️ {reason}: {side} {applied_size:.3} {leg_label} @ {trade_price:.3} — position adjusted"
@@ -1866,6 +1879,9 @@ impl MarketMonitor {
                 self.position.no_cost += no_filled * opp.no_price;
                 self.active_assets.insert(mi.tokens.no.clone());
             }
+            if yes_filled > 0.0 || no_filled > 0.0 {
+                self.note_position_activity();
+            }
 
             let reason = Self::truncate_for_action(&Self::format_error_chain(e), 180);
             self.log_action(&format!(
@@ -1895,29 +1911,46 @@ impl MarketMonitor {
         filled_cost: f64,
         filled_is_yes: bool,
     ) -> Result<f64> {
+        let min_sell_size = Self::env_f64("MIN_SELL_RESCUE_SHARES", 5.0).max(5.0);
+        let order_size = ((size * 100.0).floor() / 100.0).max(0.0);
+        if order_size < min_sell_size {
+            anyhow::bail!(
+                "rescue size {:.3} below minimum sellable {:.1} shares",
+                order_size,
+                min_sell_size
+            );
+        }
+
+        // Polymarket taker fee can leave fewer tokens than raw matched size.
+        // Clamp sell-back order size to estimated net-holdings after fee.
+        let sellable_size = ((self.fee_adjust_shares(order_size, filled_price).min(order_size) * 100.0).floor()
+            / 100.0)
+            .max(0.0);
+        let can_sell_back = sellable_size >= min_sell_size;
+
         // Estimate hedge and sell-back using live depth when available.
-        let mut expected_missing_cost = missing_price * size;
-        let mut expected_sell_proceeds = filled_price * size * 0.95;
+        let mut expected_missing_cost = missing_price * order_size;
+        let mut expected_sell_proceeds = filled_price * sellable_size * 0.95;
         if let Some((yes_book, no_book)) = self.fetch_books(mi).await {
             if missing_token_id == mi.tokens.yes {
-                expected_missing_cost = Self::estimate_buy_cost_from_book(&yes_book, size)
+                expected_missing_cost = Self::estimate_buy_cost_from_book(&yes_book, order_size)
                     .unwrap_or(expected_missing_cost);
             } else {
-                expected_missing_cost = Self::estimate_buy_cost_from_book(&no_book, size)
+                expected_missing_cost = Self::estimate_buy_cost_from_book(&no_book, order_size)
                     .unwrap_or(expected_missing_cost);
             }
-            if filled_token_id == mi.tokens.yes {
-                expected_sell_proceeds = Self::estimate_sell_proceeds_from_book(&yes_book, size)
+            if filled_token_id == mi.tokens.yes && sellable_size > 0.0 {
+                expected_sell_proceeds = Self::estimate_sell_proceeds_from_book(&yes_book, sellable_size)
                     .unwrap_or(expected_sell_proceeds);
-            } else {
-                expected_sell_proceeds = Self::estimate_sell_proceeds_from_book(&no_book, size)
+            } else if sellable_size > 0.0 {
+                expected_sell_proceeds = Self::estimate_sell_proceeds_from_book(&no_book, sellable_size)
                     .unwrap_or(expected_sell_proceeds);
             }
         }
 
         // Hedge P&L: buy missing leg and merge.
-        let actual_size_missing = self.fee_adjust_shares(size, missing_price);
-        let actual_size_filled = self.fee_adjust_shares(size, filled_price);
+        let actual_size_missing = self.fee_adjust_shares(order_size, missing_price);
+        let actual_size_filled = self.fee_adjust_shares(order_size, filled_price);
         let mergeable = actual_size_missing.min(actual_size_filled);
         let hedge_pnl = mergeable * 1.0
             - filled_cost
@@ -1925,9 +1958,29 @@ impl MarketMonitor {
             - self.gas_cache.fee_per_merge_usd;
 
         // Sell-back P&L from expected executable bid depth.
-        let sell_pnl = expected_sell_proceeds - filled_cost;
+        let sell_cost_basis = if order_size > 0.0 {
+            filled_cost * (sellable_size / order_size)
+        } else {
+            0.0
+        };
+        let sell_pnl = expected_sell_proceeds - sell_cost_basis;
 
-        let sold_back = sell_pnl >= hedge_pnl;
+        let force_buy_mode = self
+            .force_buy_hedge_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false);
+        let sold_back = !force_buy_mode && can_sell_back && sell_pnl >= hedge_pnl;
+        if !can_sell_back {
+            self.log_action(&format!(
+                "⏭ Rescue sell-back skipped: sellable {:.3} < min {:.1} shares; forcing BUY hedge.",
+                sellable_size, min_sell_size
+            ))
+            .await;
+        }
+        if force_buy_mode {
+            self.log_action("⏭ Rescue sell-back temporarily disabled after balance/allowance rejection; forcing BUY hedge.")
+                .await;
+        }
         let tick = mi.tick_size.max(0.001);
 
         let result = if sold_back {
@@ -1940,7 +1993,7 @@ impl MarketMonitor {
                     self.client.sign_order(
                         filled_token_id,
                         sell_back_price,
-                        size,
+                        sellable_size,
                         Side::Sell,
                         TimeInForce::Fok,
                         mi.neg_risk,
@@ -1962,19 +2015,36 @@ impl MarketMonitor {
                         }
                     }
                 })
-                .await?;
+                .await;
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if Self::is_balance_allowance_rejection(&e) {
+                        self.force_buy_hedge_until =
+                            Some(Instant::now() + Duration::from_secs(FORCE_BUY_HEDGE_WINDOW_SECS));
+                        self.log_action(&format!(
+                            "⚠️ Rescue sell-back rejected (balance/allowance). Switching to BUY hedge mode for {}s.",
+                            FORCE_BUY_HEDGE_WINDOW_SECS
+                        ))
+                        .await;
+                    }
+                    return Err(e);
+                }
+            };
             let matched = resp.size_matched.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
             if matched > 0.0 {
                 self.mark_response_fill_applied(&resp.order_id);
             }
-            let proceeds = matched * sell_back_price;
-            if matched > 0.0 {
-                self.log_action(&format!(
-                    "✅ Rescue sell-back fill: {matched:.2} @ {:.2}",
-                    sell_back_price
-                ))
-                .await;
+            if matched <= 0.0 {
+                anyhow::bail!("rescue sell-back posted but unfilled");
             }
+            let proceeds = matched * sell_back_price;
+            self.force_buy_hedge_until = None;
+            self.log_action(&format!(
+                "✅ Rescue sell-back fill: {matched:.2} @ {:.2}",
+                sell_back_price
+            ))
+            .await;
             self.stats.record_sellback();
             self.trade_logger
                 .log_hedge(
@@ -1999,7 +2069,7 @@ impl MarketMonitor {
                     self.client.sign_order(
                         missing_token_id,
                         hedge_buy_price, // +3 ticks aggressive, snapped to tick size
-                        size,
+                        order_size,
                         Side::Buy,
                         TimeInForce::Fok,
                         mi.neg_risk,
@@ -2025,28 +2095,29 @@ impl MarketMonitor {
             if matched > 0.0 {
                 self.mark_response_fill_applied(&resp.order_id);
             }
-            if matched > 0.0 {
-                self.log_action(&format!(
-                    "✅ Rescue hedge fill: {matched:.2} @ {:.2}",
-                    hedge_buy_price
-                ))
-                .await;
+            if matched <= 0.0 {
+                anyhow::bail!("rescue hedge posted but unfilled");
             }
+            self.force_buy_hedge_until = None;
+            self.log_action(&format!(
+                "✅ Rescue hedge fill: {matched:.2} @ {:.2}",
+                hedge_buy_price
+            ))
+            .await;
 
-            if matched > 0.0 {
-                if filled_is_yes {
-                    self.position.yes_size += matched;
-                    self.position.no_size += matched;
-                } else {
-                    self.position.no_size += matched;
-                    self.position.yes_size += matched;
-                }
-                self.active_assets.insert(mi.tokens.yes.clone());
-                self.active_assets.insert(mi.tokens.no.clone());
-                let fire_amount = self.mergeable_available();
-                self.fire_merge(fire_amount, mi).await;
-                self.stats.record_hedge();
+            if filled_is_yes {
+                self.position.yes_size += matched;
+                self.position.no_size += matched;
+            } else {
+                self.position.no_size += matched;
+                self.position.yes_size += matched;
             }
+            self.note_position_activity();
+            self.active_assets.insert(mi.tokens.yes.clone());
+            self.active_assets.insert(mi.tokens.no.clone());
+            let fire_amount = self.mergeable_available();
+            self.fire_merge(fire_amount, mi).await;
+            self.stats.record_hedge();
 
             let actual_matched_missing = self.fee_adjust_shares(matched, missing_price);
             let actual_matched_filled = self.fee_adjust_shares(matched, filled_price);
@@ -2060,7 +2131,7 @@ impl MarketMonitor {
                     filled_cost + matched * missing_price,
                     actual_hedge_pnl,
                     false,
-                    matched > 0.0,
+                    true,
                     None,
                 )
                 .await;
@@ -2105,7 +2176,7 @@ impl MarketMonitor {
                 )
             };
 
-        let min_imbalance_size = Self::env_f64("MIN_IMBALANCE_HEDGE_SIZE", 1.0).max(0.01);
+        let min_imbalance_size = Self::env_f64("MIN_IMBALANCE_HEDGE_SIZE", 5.0).max(5.0);
         let mut size = yes_excess.abs().min(self.config.max_trade_size);
         size = (size * 100.0).floor() / 100.0;
         if size < min_imbalance_size {
@@ -2159,7 +2230,28 @@ impl MarketMonitor {
             - expected_missing_cost
             - self.gas_cache.fee_per_merge_usd;
         let sell_pnl = expected_sell_proceeds - filled_cost_basis;
-        let sell_back = sell_pnl >= hedge_pnl;
+        let sell_size = ((self.fee_adjust_shares(size, filled_price).min(size) * 100.0).floor() / 100.0).max(0.0);
+        let can_sell_back = sell_size >= min_imbalance_size;
+        let force_buy_mode = self
+            .force_buy_hedge_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false);
+        let sell_back = !force_buy_mode && can_sell_back && sell_pnl >= hedge_pnl;
+
+        if !can_sell_back {
+            self.log_action(&format!(
+                "⏭ Imbalance sell-back skipped: sellable {:.3} < min {:.1} shares; forcing BUY hedge.",
+                sell_size, min_imbalance_size
+            ))
+            .await;
+        }
+        if force_buy_mode {
+            self.log_action(&format!(
+                "⏭ Imbalance sell-back temporarily disabled for {}s after balance/allowance rejection; forcing BUY hedge.",
+                FORCE_BUY_HEDGE_WINDOW_SECS
+            ))
+            .await;
+        }
 
         self.log_action(&format!(
             "📊 Smart hedge: {} better (sell PnL: ${:+.2} vs hedge PnL: ${:+.2})",
@@ -2183,7 +2275,7 @@ impl MarketMonitor {
                     self.client.sign_order(
                         filled_token,
                         sell_back_price,
-                        size,
+                        sell_size,
                         Side::Sell,
                         TimeInForce::Fok,
                         mi.neg_risk,
@@ -2239,8 +2331,12 @@ impl MarketMonitor {
                                     sell_back_price,
                                 )
                             };
+                            if reduced > 0.0 {
+                                self.note_position_activity();
+                            }
                             self.consecutive_hedge_failures = 0;
                             self.hedge_cooldown_until = None;
+                            self.force_buy_hedge_until = None;
                             self.log_action(&format!(
                                 "✅ Imbalance sell-back fill: -{reduced:.2} {filled_label} @ {:.2}",
                                 sell_back_price
@@ -2257,13 +2353,24 @@ impl MarketMonitor {
                     }
                     Err(e) => {
                         warn!("Imbalance sell-back failed: {}", Self::format_error_chain(&e));
-                        let cooldown_secs = self.on_hedge_failure();
-                        let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 160);
-                        self.log_action(&format!(
-                            "⚠️ Imbalance sell-back failed ({}) — cooldown {}s",
-                            reason, cooldown_secs
-                        ))
-                        .await;
+                        if Self::is_balance_allowance_rejection(&e) {
+                            self.force_buy_hedge_until =
+                                Some(Instant::now() + Duration::from_secs(FORCE_BUY_HEDGE_WINDOW_SECS));
+                            self.hedge_cooldown_until = None;
+                            self.log_action(&format!(
+                                "⚠️ Imbalance sell-back rejected (balance/allowance). Switching to BUY hedge mode for {}s.",
+                                FORCE_BUY_HEDGE_WINDOW_SECS
+                            ))
+                            .await;
+                        } else {
+                            let cooldown_secs = self.on_hedge_failure();
+                            let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 160);
+                            self.log_action(&format!(
+                                "⚠️ Imbalance sell-back failed ({}) — cooldown {}s",
+                                reason, cooldown_secs
+                            ))
+                            .await;
+                        }
                     }
                 },
                 Err(e) => {
@@ -2339,8 +2446,12 @@ impl MarketMonitor {
                                     hedge_price,
                                 )
                             };
+                            if added > 0.0 {
+                                self.note_position_activity();
+                            }
                             self.consecutive_hedge_failures = 0;
                             self.hedge_cooldown_until = None;
+                            self.force_buy_hedge_until = None;
                             self.log_action(&format!(
                                 "✅ Imbalance hedge fill: +{added:.2} {}",
                                 missing_label
@@ -2524,6 +2635,7 @@ impl MarketMonitor {
             if msg.success {
                 self.position.yes_size = (self.position.yes_size - released_size).max(0.0);
                 self.position.no_size = (self.position.no_size - released_size).max(0.0);
+                self.note_position_activity();
                 self.log_action(&format!(
                     "✅ Merge confirmed: {:.2} shares → USDC | tx={}",
                     released_size,
@@ -2831,6 +2943,7 @@ impl MarketMonitor {
                 if yes_filled > 0.01 || no_filled > 0.01 {
                     self.position.yes_size += yes_filled;
                     self.position.no_size += no_filled;
+                    self.note_position_activity();
                     self.active_assets.insert(mi.tokens.yes.clone());
                     self.active_assets.insert(mi.tokens.no.clone());
 
@@ -3108,13 +3221,21 @@ impl MarketMonitor {
         let Some(mi) = market_opt else {
             return;
         };
-        let rpc = crate::clob_client::POLYGON_RPCS[0];
-        let (yes_on_chain, no_on_chain) = tokio::join!(
-            client.get_ctf_balance(&mi.tokens.yes, holder, rpc),
-            client.get_ctf_balance(&mi.tokens.no, holder, rpc),
-        );
-        let yes_on_chain = yes_on_chain.unwrap_or(0.0);
-        let no_on_chain = no_on_chain.unwrap_or(0.0);
+        // Read across configured RPCs and take the max observed per leg to reduce stale/laggy-node zeros.
+        let mut yes_on_chain = 0.0_f64;
+        let mut no_on_chain = 0.0_f64;
+        for rpc in &crate::clob_client::POLYGON_RPCS {
+            let (yes_res, no_res) = tokio::join!(
+                client.get_ctf_balance(&mi.tokens.yes, holder, rpc),
+                client.get_ctf_balance(&mi.tokens.no, holder, rpc),
+            );
+            if let Ok(v) = yes_res {
+                yes_on_chain = yes_on_chain.max(v);
+            }
+            if let Ok(v) = no_res {
+                no_on_chain = no_on_chain.max(v);
+            }
+        }
 
         let mut m = match monitor.try_lock() {
             Ok(g) => g,
@@ -3137,8 +3258,28 @@ impl MarketMonitor {
                 yes_on_chain, no_on_chain, in_mem_yes, in_mem_no
             ));
 
+            let on_chain_near_zero = yes_on_chain <= 0.01 && no_on_chain <= 0.01;
+            let in_mem_has_position = m.position.yes_size > 0.01 || m.position.no_size > 0.01;
+            let recent_position_activity = m
+                .last_position_activity_at
+                .map(|t| t.elapsed() < Duration::from_secs(RECONCILE_ZERO_SYNC_GRACE_SECS))
+                .unwrap_or(false);
+
+            let required_streak = if on_chain_near_zero && in_mem_has_position {
+                RECONCILE_ZERO_SYNC_STREAK
+            } else {
+                RECONCILE_NONZERO_SYNC_STREAK
+            };
+            let defer_zero_sync = on_chain_near_zero && in_mem_has_position && recent_position_activity;
+            if defer_zero_sync && (m.reconcile_drift_streak == 1 || m.reconcile_drift_streak % 6 == 0) {
+                m.log_action_fast(&format!(
+                    "⏳ Reconcile deferring zero-sync for {}s after recent fills (possible settlement lag)",
+                    RECONCILE_ZERO_SYNC_GRACE_SECS
+                ));
+            }
+
             // If drift persists, trust on-chain balances and force-sync in-memory state.
-            if m.reconcile_drift_streak >= 3 {
+            if m.reconcile_drift_streak >= required_streak && !defer_zero_sync {
                 let prev_yes_size = m.position.yes_size;
                 let prev_no_size = m.position.no_size;
                 let prev_yes_cost = m.position.yes_cost;
@@ -3170,6 +3311,7 @@ impl MarketMonitor {
                     "🧭 Position reconciled to on-chain YES/NO {:.2}/{:.2} after persistent drift",
                     synced_yes, synced_no
                 ));
+                m.note_position_activity();
                 m.reconcile_drift_streak = 0;
             }
         } else {
@@ -3178,6 +3320,10 @@ impl MarketMonitor {
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    fn note_position_activity(&mut self) {
+        self.last_position_activity_at = Some(Instant::now());
+    }
 
     fn mergeable_available(&self) -> f64 {
         (self.position.mergeable_amount() - self.pending_merge_reserved_size).max(0.0)
@@ -3269,6 +3415,13 @@ impl MarketMonitor {
         let mut out = message.chars().take(max_chars).collect::<String>();
         out.push_str("...");
         out
+    }
+
+    fn is_balance_allowance_rejection(error: &anyhow::Error) -> bool {
+        let msg = Self::format_error_chain(error).to_ascii_lowercase();
+        msg.contains("not enough balance")
+            || msg.contains("insufficient balance")
+            || msg.contains("allowance")
     }
 
     fn taker_time_in_force() -> TimeInForce {
@@ -4141,7 +4294,9 @@ mod tests {
             ws_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
             response_applied_order_ids: HashSet::new(),
             response_applied_order_queue: VecDeque::with_capacity(MAX_RESPONSE_APPLIED_ORDER_IDS + 1),
+            last_position_activity_at: None,
             reconcile_drift_streak: 0,
+            force_buy_hedge_until: None,
         })
     }
 
