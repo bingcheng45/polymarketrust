@@ -169,10 +169,12 @@ pub enum Side {
     Sell,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TimeInForce {
     #[serde(rename = "FOK")]
     Fok,
+    #[serde(rename = "FAK")]
+    Fak,
     #[serde(rename = "GTC")]
     Gtc,
     #[serde(rename = "GTD")]

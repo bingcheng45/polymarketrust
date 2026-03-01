@@ -40,8 +40,10 @@ async fn main() -> Result<()> {
     let yes_ask = book.best_ask().unwrap_or(0.5);
     println!("YES ask : {yes_ask:.3}");
 
-    // Place a minimal order far from the market (very unlikely to fill)
-    let test_price = (yes_ask - 0.05).max(0.01);
+    // Place a minimal order far from the market (very unlikely to fill).
+    // Round to market tick precision to avoid float artefacts like 0.5199999999.
+    let raw_test_price = (yes_ask - 0.05).max(0.01);
+    let test_price = (raw_test_price * 100.0).round() / 100.0;
     let test_size = 1.0;
 
     println!("Placing test GTC BUY: size={test_size} @ {test_price:.3}…");

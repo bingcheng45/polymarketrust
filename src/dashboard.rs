@@ -247,7 +247,7 @@ impl Dashboard {
             };
             let reset = "\x1b[0m";
             out.push_str(&format!(
-                "   Daily PnL: {color}{sign}${pnl:.3} ({sign}{pnl_pct:.1}%){reset} | Session Successes: {} | Session Failures: {}\n",
+                "   Daily PnL: {color}{sign}${pnl:.3} ({sign}{pnl_pct:.1}%){reset} | successes: {} | failures: {}\n",
                 state.session_successes, state.session_failures
             ));
         }

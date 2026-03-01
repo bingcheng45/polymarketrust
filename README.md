@@ -65,12 +65,25 @@ Key parameters:
 |---|---|---|
 | `MARKET_SLUG` | `btc-updown-15m` | Market slug prefix (comma-separated for multi-market) |
 | `MAX_TRADE_SIZE` | `50` | Max shares per arb execution |
+| `MIN_PAIRED_SHARES` | `5` | Minimum paired size required after fee adjustment |
+| `MIN_CHILD_ORDER_SIZE` | `5` | Minimum child slice size for taker batching |
+| `TARGET_CHILD_ORDER_SIZE` | `5` | Target child slice size for taker batching |
+| `MAX_TAKER_BATCHES` | `8` | Upper bound on child slices per opportunity |
 | `MIN_NET_PROFIT_USD` | `0.05` | Minimum profit threshold |
 | `MOCK_CURRENCY` | `false` | Paper trading mode (no real orders) |
 | `WS_ENABLED` | `true` | Enable WebSocket feed |
-| `MAKER_MODE_ENABLED` | `false` | Use GTC limit orders instead of FOK |
+| `MAKER_MODE_ENABLED` | `false` | Use GTC resting maker orders instead of immediate taker |
+| `TAKER_ORDER_TYPE` | `FAK` | Immediate taker type (`FAK` or `FOK`) |
+| `PRE_SUBMIT_SIGNAL_MAX_AGE_MS` | `450` | Drop stale opportunities before order submit |
+| `PRE_SUBMIT_PAIR_DRIFT_MAX` | `0.01` | Max allowed pair-cost drift before submit |
+| `PRE_SUBMIT_MIN_LIQ_FACTOR` | `0.90` | Min depth fraction required at submit time |
 | `WS_FILL_PRIMARY` | `true` | Use User WS stream as primary fill source |
 | `WS_FILL_FALLBACK_POLL_MS` | `300` | Poll fallback interval when WS fill stream is stale |
+| `SDK_POST_TIMEOUT_MS` | `1800` | Timeout for order submit calls |
+| `POST_BATCH_MAX_RETRIES` | `2` | Retries for transient batch submit failures |
+| `SDK_RETRY_BASE_DELAY_MS` | `60` | Retry backoff base delay |
+| `SDK_RETRY_MAX_DELAY_MS` | `600` | Retry backoff cap |
+| `DISABLE_SYSTEM_PROXY` | `true` | Ignore `HTTP(S)_PROXY` for lower-latency direct path |
 | `ADAPTIVE_THROTTLE_MIN_MS` | `0` | Minimum trigger interval for actionable deltas |
 | `ADAPTIVE_THROTTLE_BURST_DEBOUNCE_MS` | `8` | Debounce interval for noisy WS bursts |
 | `ACTIONABLE_DELTA_MIN_TICKS` | `1` | Tick movement threshold treated as actionable |

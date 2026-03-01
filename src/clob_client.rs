@@ -12,12 +12,12 @@ use crate::types::{
     GammaEvent, GammaMarket, MarketInfo, OpenOrder, OrderBook, OrderResponse,
     Side, SignedOrder, TimeInForce, TokenIds, TradeRecord,
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
@@ -58,7 +58,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer as AlloySigner;
 use alloy::sol_types::SolCall;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 // ─── Solidity interfaces via alloy sol! macro ─────────────────────────────────
@@ -120,9 +120,28 @@ impl ClobClient {
     pub async fn new(config: Arc<Config>) -> Result<Self> {
         crate::init_rustls_provider();
 
-        let http = reqwest::Client::builder()
+        let disable_system_proxy = std::env::var("DISABLE_SYSTEM_PROXY")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+        if disable_system_proxy
+            && (std::env::var("HTTP_PROXY").is_ok()
+                || std::env::var("HTTPS_PROXY").is_ok()
+                || std::env::var("ALL_PROXY").is_ok())
+        {
+            warn!(
+                "DISABLE_SYSTEM_PROXY=true: ignoring HTTP(S)_PROXY/ALL_PROXY for lower latency path"
+            );
+        }
+
+        let mut http_builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .build()?;
+            .connect_timeout(Duration::from_secs(2))
+            .pool_idle_timeout(Duration::from_secs(30));
+        if disable_system_proxy {
+            http_builder = http_builder.no_proxy();
+        }
+        let http = http_builder.build()?;
 
         let raw_key = config.private_key.trim_start_matches("0x");
 
@@ -205,6 +224,7 @@ impl ClobClient {
         };
         let sdk_order_type = match time_in_force {
             TimeInForce::Fok => SdkOrderType::FOK,
+            TimeInForce::Fak => SdkOrderType::FAK,
             TimeInForce::Gtc => SdkOrderType::GTC,
             TimeInForce::Gtd => SdkOrderType::GTD,
         };
@@ -490,55 +510,119 @@ impl ClobClient {
 
         let now = Utc::now();
         let end_date_min = now.to_rfc3339_opts(SecondsFormat::Secs, true);
-        let mut url = format!(
-            "{GAMMA_BASE}/events?limit=100&active=true&closed=false&order=endDate&ascending=true&end_date_min={end_date_min}"
-        );
-        if let Some(tid) = tag_id {
-            url.push_str(&format!("&tag_id={tid}"));
-        }
-
-        let resp = self.http.get(&url).send().await?;
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
-
-        let events: Vec<GammaEvent> = resp
-            .json()
-            .await
-            .context("Failed to parse Gamma events")?;
-
-        if events.is_empty() {
-            return Ok(None);
-        }
-
         let min_end_date = now + ChronoDuration::seconds(MARKET_EXPIRY_BUFFER_SECS);
-        let sorted = select_market_candidates(events, &slug_prefix, min_end_date);
 
-        for (m, end_date) in sorted {
-            let clob_token_ids_str = match &m.clob_token_ids {
-                Some(s) => s,
-                None => continue,
+        let build_url = |with_end_date_min: bool, with_tag_id: Option<u64>| {
+            let mut url = format!(
+                "{GAMMA_BASE}/events?limit=100&active=true&closed=false&order=endDate&ascending=true"
+            );
+            if with_end_date_min {
+                url.push_str(&format!("&end_date_min={end_date_min}"));
+            }
+            if let Some(tid) = with_tag_id {
+                url.push_str(&format!("&tag_id={tid}"));
+            }
+            url
+        };
+
+        // Primary query is strict; fallbacks protect against transient tag/filter/API inconsistencies.
+        let query_plan = [
+            ("tag+end_date_min", true, tag_id),
+            ("no_tag+end_date_min", true, None),
+            ("tag_only", false, tag_id),
+            ("no_tag", false, None),
+        ];
+
+        let mut seen_urls = HashSet::new();
+        let mut had_successful_gamma_response = false;
+        let mut last_gamma_error: Option<anyhow::Error> = None;
+
+        for (label, with_end_date_min, with_tag_id) in query_plan {
+            let url = build_url(with_end_date_min, with_tag_id);
+            if !seen_urls.insert(url.clone()) {
+                continue;
+            }
+
+            let events = match self.fetch_gamma_events(&url).await {
+                Ok(events) => {
+                    had_successful_gamma_response = true;
+                    events
+                }
+                Err(e) => {
+                    warn!(
+                        "Gamma discovery query '{label}' failed for slug '{slug_prefix}': {e}"
+                    );
+                    last_gamma_error = Some(e);
+                    continue;
+                }
             };
 
-            let (yes, no) = match extract_binary_token_pair(clob_token_ids_str, m.outcomes.as_deref()) {
-                Some((y, n)) => (y, n),
-                _ => continue,
-            };
+            if events.is_empty() {
+                continue;
+            }
 
-            return Ok(Some(MarketInfo {
-                condition_id: m.condition_id,
-                question: m.question,
-                end_date,
-                neg_risk: m.neg_risk,
-                tick_size: m.tick_size.unwrap_or(0.01),
-                tokens: TokenIds {
-                    yes,
-                    no,
-                },
-            }));
+            let sorted = select_market_candidates(events, &slug_prefix, min_end_date);
+            for (m, end_date) in sorted {
+                let clob_token_ids_str = match &m.clob_token_ids {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let (yes, no) = match extract_binary_token_pair(clob_token_ids_str, m.outcomes.as_deref()) {
+                    Some((y, n)) => (y, n),
+                    _ => continue,
+                };
+
+                return Ok(Some(MarketInfo {
+                    condition_id: m.condition_id,
+                    question: m.question,
+                    end_date,
+                    neg_risk: m.neg_risk,
+                    tick_size: m.tick_size.unwrap_or(0.01),
+                    tokens: TokenIds {
+                        yes,
+                        no,
+                    },
+                }));
+            }
+        }
+
+        if !had_successful_gamma_response {
+            if let Some(err) = last_gamma_error {
+                return Err(err).context(format!(
+                    "all Gamma discovery queries failed for slug '{slug_prefix}'"
+                ));
+            }
         }
 
         Ok(None)
+    }
+
+    async fn fetch_gamma_events(&self, url: &str) -> Result<Vec<GammaEvent>> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Gamma request failed: {url}"))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("Failed to read Gamma response body")?;
+
+        if !status.is_success() {
+            let snippet: String = body.chars().take(240).collect();
+            return Err(anyhow!(
+                "Gamma events API HTTP {} for {} | body: {}",
+                status,
+                url,
+                snippet
+            ));
+        }
+
+        serde_json::from_str::<Vec<GammaEvent>>(&body)
+            .with_context(|| format!("Failed to parse Gamma events payload from {url}"))
     }
 
     // ─── Price Feeds ──────────────────────────────────────────────────────────

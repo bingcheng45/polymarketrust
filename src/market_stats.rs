@@ -61,7 +61,8 @@ impl MarketStatsTracker {
         self.stats.avg_arb_spread = self.arb_spreads.iter().sum::<f64>() / n;
     }
 
-    /// Record an executed arb trade.
+    /// Record one attempted arbitrage opportunity.
+    /// `success=false` means the opportunity was attempted but failed.
     pub fn record_execution(&mut self, success: bool, pnl: f64) {
         self.stats.total_arb_executions += 1;
         if success {
