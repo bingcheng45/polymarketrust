@@ -72,6 +72,10 @@ const MAX_SEEN_WS_TRADE_IDS: usize = 8_192;
 const MAX_RESPONSE_APPLIED_ORDER_IDS: usize = 8_192;
 const IMBALANCE_DUST_RECHECK_SECS: u64 = 20;
 const FORCE_BUY_HEDGE_WINDOW_SECS: u64 = 300;
+const RECONCILE_LARGE_DRIFT_SHARES: f64 = 2.0;
+const RECONCILE_DUST_MAX_SHARES: f64 = 1.0;
+const RECONCILE_DUST_DRIFT_MIN_SHARES: f64 = 0.05;
+const RECONCILE_DUST_SYNC_STREAK: u32 = 3;
 const RECONCILE_NONZERO_SYNC_STREAK: u32 = 3;
 const RECONCILE_ZERO_SYNC_STREAK: u32 = 6;
 const RECONCILE_ZERO_SYNC_GRACE_SECS: u64 = 180;
@@ -3248,7 +3252,52 @@ impl MarketMonitor {
             m.merge_mismatch_count = m.merge_mismatch_count.saturating_add(1);
             m.pending_merge_reserved_size = max_reservable.max(0.0);
         }
-        if yes_drift > 2.0 || no_drift > 2.0 {
+        let on_chain_near_zero = yes_on_chain <= 0.01 && no_on_chain <= 0.01;
+        let in_mem_has_position = m.position.yes_size > 0.01 || m.position.no_size > 0.01;
+        let in_mem_is_dust = m.position.yes_size <= RECONCILE_DUST_MAX_SHARES
+            && m.position.no_size <= RECONCILE_DUST_MAX_SHARES;
+        let dust_drift = yes_drift.max(no_drift);
+        let recent_position_activity = m
+            .last_position_activity_at
+            .map(|t| t.elapsed() < Duration::from_secs(RECONCILE_ZERO_SYNC_GRACE_SECS))
+            .unwrap_or(false);
+        let defer_zero_sync = on_chain_near_zero && in_mem_has_position && recent_position_activity;
+        let dust_zero_sync_candidate = on_chain_near_zero
+            && in_mem_has_position
+            && in_mem_is_dust
+            && dust_drift >= RECONCILE_DUST_DRIFT_MIN_SHARES;
+
+        if dust_zero_sync_candidate {
+            m.reconcile_drift_streak = m.reconcile_drift_streak.saturating_add(1);
+            m.merge_mismatch_count = m.merge_mismatch_count.saturating_add(1);
+            if m.reconcile_drift_streak == 1 || m.reconcile_drift_streak % 6 == 0 {
+                let in_mem_yes = m.position.yes_size;
+                let in_mem_no = m.position.no_size;
+                m.log_action_fast(&format!(
+                    "⚠️ Reconcile dust drift: on-chain zero but in-mem YES/NO {:.3}/{:.3}",
+                    in_mem_yes, in_mem_no
+                ));
+            }
+            if defer_zero_sync {
+                if m.reconcile_drift_streak == 1 || m.reconcile_drift_streak % 6 == 0 {
+                    m.log_action_fast(&format!(
+                        "⏳ Reconcile deferring dust zero-sync for {}s after recent fills (possible settlement lag)",
+                        RECONCILE_ZERO_SYNC_GRACE_SECS
+                    ));
+                }
+            } else if m.reconcile_drift_streak >= RECONCILE_DUST_SYNC_STREAK {
+                m.position.yes_size = 0.0;
+                m.position.no_size = 0.0;
+                m.position.yes_cost = 0.0;
+                m.position.no_cost = 0.0;
+                m.pending_merge_reserved_size = 0.0;
+                m.log_action_fast(
+                    "🧭 Cleared stale dust position from reconcile (on-chain balances are zero)"
+                );
+                m.note_position_activity();
+                m.reconcile_drift_streak = 0;
+            }
+        } else if yes_drift > RECONCILE_LARGE_DRIFT_SHARES || no_drift > RECONCILE_LARGE_DRIFT_SHARES {
             m.reconcile_drift_streak = m.reconcile_drift_streak.saturating_add(1);
             m.merge_mismatch_count = m.merge_mismatch_count.saturating_add(1);
             let in_mem_yes = m.position.yes_size;
@@ -3257,20 +3306,11 @@ impl MarketMonitor {
                 "⚠️ Reconcile drift detected: on-chain YES/NO {:.2}/{:.2} vs in-mem {:.2}/{:.2}",
                 yes_on_chain, no_on_chain, in_mem_yes, in_mem_no
             ));
-
-            let on_chain_near_zero = yes_on_chain <= 0.01 && no_on_chain <= 0.01;
-            let in_mem_has_position = m.position.yes_size > 0.01 || m.position.no_size > 0.01;
-            let recent_position_activity = m
-                .last_position_activity_at
-                .map(|t| t.elapsed() < Duration::from_secs(RECONCILE_ZERO_SYNC_GRACE_SECS))
-                .unwrap_or(false);
-
             let required_streak = if on_chain_near_zero && in_mem_has_position {
                 RECONCILE_ZERO_SYNC_STREAK
             } else {
                 RECONCILE_NONZERO_SYNC_STREAK
             };
-            let defer_zero_sync = on_chain_near_zero && in_mem_has_position && recent_position_activity;
             if defer_zero_sync && (m.reconcile_drift_streak == 1 || m.reconcile_drift_streak % 6 == 0) {
                 m.log_action_fast(&format!(
                     "⏳ Reconcile deferring zero-sync for {}s after recent fills (possible settlement lag)",
