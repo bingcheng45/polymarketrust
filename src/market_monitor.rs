@@ -398,6 +398,7 @@ impl MarketMonitor {
         };
         self.session_start_balance = balance;
         self.last_balance = Some(balance);
+        self.sync_daily_pnl_from_balance();
 
         // 2. Init session logger
         let market_slug = self.config.market_slugs.join(",");
@@ -3742,6 +3743,7 @@ impl MarketMonitor {
             Ok(balance) => {
                 m.last_balance = Some(balance);
                 m.last_balance_refresh = Instant::now();
+                m.sync_daily_pnl_from_balance();
                 m.request_render();
             }
             Err(e) => {
@@ -3976,8 +3978,13 @@ impl MarketMonitor {
     }
 
     fn sync_daily_pnl_from_components(&mut self) {
-        self.daily_pnl =
-            self.execution_pnl + self.hedge_sellback_pnl + self.redemption_pnl + self.fees_gas_estimate;
+        // Headline PnL should track wallet reality, not model components.
+        self.sync_daily_pnl_from_balance();
+    }
+
+    fn sync_daily_pnl_from_balance(&mut self) {
+        let balance = self.last_balance.unwrap_or(0.0);
+        self.daily_pnl = balance - self.session_start_balance;
     }
 
     fn record_execution_result(&mut self, pnl: f64) {
@@ -5559,7 +5566,7 @@ mod tests {
         assert_eq!(monitor.stats.stats.successes, 3);
         assert_eq!(monitor.stats.stats.failures, 5);
         assert!((monitor.stats.stats.total_pnl_usd - 1.7).abs() < 1e-9);
-        assert!((monitor.daily_pnl - 1.0).abs() < 1e-9);
+        assert!((monitor.daily_pnl - 0.0).abs() < 1e-9);
         assert_eq!(monitor.execution_success_count, 1);
         assert_eq!(monitor.economic_success_count, 1);
     }
@@ -5629,20 +5636,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pnl_components_sum_to_daily_pnl() {
+    async fn test_daily_pnl_tracks_balance_delta() {
         let Some(mut monitor) = mock_monitor().await else {
             return;
         };
-        monitor.execution_pnl = 1.25;
-        monitor.hedge_sellback_pnl = -0.40;
-        monitor.redemption_pnl = 0.90;
-        monitor.fees_gas_estimate = -0.15;
+        monitor.session_start_balance = 100.0;
+        monitor.last_balance = Some(112.34);
         monitor.sync_daily_pnl_from_components();
 
-        let expected = monitor.execution_pnl
-            + monitor.hedge_sellback_pnl
-            + monitor.redemption_pnl
-            + monitor.fees_gas_estimate;
-        assert!((monitor.daily_pnl - expected).abs() < 1e-9);
+        assert!((monitor.daily_pnl - 12.34).abs() < 1e-9);
     }
 }

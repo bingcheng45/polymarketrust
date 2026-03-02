@@ -254,11 +254,11 @@ impl Dashboard {
             };
             let reset = "\x1b[0m";
             out.push_str(&format!(
-                "   Daily PnL: {color}{sign}${pnl:.3} ({sign}{pnl_pct:.1}%){reset} | successes: {} | failures: {}\n",
+                "   Daily PnL (balance delta): {color}{sign}${pnl:.3} ({sign}{pnl_pct:.1}%){reset} | successes: {} | failures: {}\n",
                 state.session_successes, state.session_failures
             ));
             out.push_str(&format!(
-                "   PnL parts: exec ${:+.3} | hedge/sell-back ${:+.3} | redemption ${:+.3} | fees+gas ${:+.3}\n",
+                "   Engine estimates: exec ${:+.3} | hedge/sell-back ${:+.3} | redemption ${:+.3} | fees+gas ${:+.3}\n",
                 state.execution_pnl,
                 state.hedge_sellback_pnl,
                 state.redemption_pnl,
