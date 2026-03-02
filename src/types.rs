@@ -106,6 +106,7 @@ pub struct ArbOpportunity {
 pub enum ExecutionState {
     Planned,
     Posted,
+    AmbiguousTimeout,
     Partial,
     Paired,
     HedgePending,

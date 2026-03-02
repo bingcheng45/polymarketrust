@@ -52,7 +52,7 @@ const PERF_LOG_INTERVAL_SECS: u64 = 60;
 const WS_AGE_SAMPLE_INTERVAL_MS: u64 = 250;
 const ORDER_STATUS_TIMEOUT_MS: u64 = 1_500;
 const SDK_CALL_TIMEOUT_MS: u64 = 1_500;
-const SDK_POST_TIMEOUT_MS: u64 = 1_800;
+const SDK_POST_TIMEOUT_MS: u64 = 3_000;
 const SDK_CANCEL_TIMEOUT_MS: u64 = 1_200;
 const SDK_ORDER_LOOKUP_TIMEOUT_MS: u64 = 1_200;
 const POST_RETRY_MAX_RETRIES: u64 = 2;
@@ -71,7 +71,6 @@ const MAX_WS_MARKET_EVENTS_PER_CYCLE: usize = 64;
 const MAX_SEEN_WS_TRADE_IDS: usize = 8_192;
 const MAX_RESPONSE_APPLIED_ORDER_IDS: usize = 8_192;
 const IMBALANCE_DUST_RECHECK_SECS: u64 = 20;
-const FORCE_BUY_HEDGE_WINDOW_SECS: u64 = 300;
 const RECONCILE_LARGE_DRIFT_SHARES: f64 = 2.0;
 const RECONCILE_DUST_MAX_SHARES: f64 = 1.0;
 const RECONCILE_DUST_DRIFT_MIN_SHARES: f64 = 0.05;
@@ -79,6 +78,24 @@ const RECONCILE_DUST_SYNC_STREAK: u32 = 3;
 const RECONCILE_NONZERO_SYNC_STREAK: u32 = 3;
 const RECONCILE_ZERO_SYNC_STREAK: u32 = 6;
 const RECONCILE_ZERO_SYNC_GRACE_SECS: u64 = 180;
+const ENTRY_LOCK_RECONCILE_DRIFT_STREAK: u32 = 2;
+const ENTRY_LOCK_LOG_INTERVAL_SECS: u64 = 5;
+const DISCOVERY_DEGRADED_WARN_INTERVAL_SECS: u64 = 60;
+const ADAPTIVE_WINDOW_SIZE: usize = 30;
+const ADAPTIVE_MIN_COMPLETION_RATIO: f64 = 0.20;
+const ADAPTIVE_MIN_PROFIT_STEP: f64 = 0.02;
+const ADAPTIVE_MIN_PROFIT_CAP: f64 = 0.14;
+const ADAPTIVE_MAX_SIZE_STEP: f64 = 2.0;
+const ADAPTIVE_MIN_SIZE_FLOOR: f64 = 5.0;
+const REST_RECOVERY_POLL_LOOKBACK_MAX_TRADES: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryLockReason {
+    Imbalance,
+    TimeoutRecovery,
+    AmbiguousFill,
+    ReconcileDrift,
+}
 
 #[derive(Debug, Clone, Default)]
 struct PostedOrderIds {
@@ -127,8 +144,20 @@ pub struct MarketMonitor {
 
     // Circuit breaker
     daily_pnl: f64,
+    execution_pnl: f64,
+    hedge_sellback_pnl: f64,
+    redemption_pnl: f64,
+    fees_gas_estimate: f64,
+    execution_success_count: u64,
+    economic_success_count: u64,
     consecutive_failures: u32,
     circuit_breaker_until: Option<Instant>,
+    entry_lock_until: Option<Instant>,
+    entry_lock_reason: Option<EntryLockReason>,
+    timeout_recovery_active: bool,
+    unresolved_ambiguous_batches: HashSet<String>,
+    last_entry_lock_log_reason: Option<EntryLockReason>,
+    last_entry_lock_log_at: Option<Instant>,
 
     // Hedge cooldown (after imbalance)
     hedge_cooldown_until: Option<Instant>,
@@ -145,6 +174,8 @@ pub struct MarketMonitor {
     last_merge_attempt: Option<Instant>,
     last_claim_poll: Option<Instant>,
     last_market_discovery_attempt: Option<Instant>,
+    discovery_failure_since: Option<Instant>,
+    last_discovery_degraded_warn_at: Option<Instant>,
     force_claim_scan: bool,
 
     // Last time we checked for opportunity
@@ -215,7 +246,13 @@ pub struct MarketMonitor {
     response_applied_order_queue: VecDeque<String>,
     last_position_activity_at: Option<Instant>,
     reconcile_drift_streak: u32,
-    force_buy_hedge_until: Option<Instant>,
+    adaptive_min_profit_usd: f64,
+    adaptive_max_trade_size: f64,
+    recent_opportunity_completion: VecDeque<bool>,
+    last_yes_mid_price: Option<f64>,
+    last_no_mid_price: Option<f64>,
+    seen_rest_trade_ids: HashSet<String>,
+    rest_trade_id_queue: VecDeque<String>,
 }
 
 impl MarketMonitor {
@@ -230,6 +267,8 @@ impl MarketMonitor {
             None
         };
         let (merge_result_tx, merge_result_rx) = mpsc::unbounded_channel();
+        let adaptive_min_profit_usd = config.min_net_profit_usd;
+        let adaptive_max_trade_size = config.max_trade_size;
 
         Ok(Self {
             config,
@@ -248,8 +287,20 @@ impl MarketMonitor {
             session_successes_baseline,
             session_failures_baseline,
             daily_pnl: 0.0,
+            execution_pnl: 0.0,
+            hedge_sellback_pnl: 0.0,
+            redemption_pnl: 0.0,
+            fees_gas_estimate: 0.0,
+            execution_success_count: 0,
+            economic_success_count: 0,
             consecutive_failures: 0,
             circuit_breaker_until: None,
+            entry_lock_until: None,
+            entry_lock_reason: None,
+            timeout_recovery_active: false,
+            unresolved_ambiguous_batches: HashSet::new(),
+            last_entry_lock_log_reason: None,
+            last_entry_lock_log_at: None,
             hedge_cooldown_until: None,
             consecutive_hedge_failures: 0,
             active_assets: HashSet::new(),
@@ -258,6 +309,8 @@ impl MarketMonitor {
             last_merge_attempt: None,
             last_claim_poll: None,
             last_market_discovery_attempt: None,
+            discovery_failure_since: None,
+            last_discovery_degraded_warn_at: None,
             force_claim_scan: false,
             last_check: None,
             errors: Vec::new(),
@@ -315,7 +368,13 @@ impl MarketMonitor {
             response_applied_order_queue: VecDeque::with_capacity(MAX_RESPONSE_APPLIED_ORDER_IDS + 1),
             last_position_activity_at: None,
             reconcile_drift_streak: 0,
-            force_buy_hedge_until: None,
+            adaptive_min_profit_usd,
+            adaptive_max_trade_size,
+            recent_opportunity_completion: VecDeque::with_capacity(ADAPTIVE_WINDOW_SIZE + 1),
+            last_yes_mid_price: None,
+            last_no_mid_price: None,
+            seen_rest_trade_ids: HashSet::new(),
+            rest_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
         })
     }
 
@@ -354,8 +413,12 @@ impl MarketMonitor {
         loop {
             self.last_market_discovery_attempt = Some(Instant::now());
             match self.find_active_market().await {
-                Ok(true) => break,
+                Ok(true) => {
+                    self.clear_discovery_degraded_state();
+                    break;
+                }
                 Ok(false) => {
+                    self.clear_discovery_degraded_state();
                     self.log_action(&format!(
                         "⏳ No active market yet. Retrying in {}s...",
                         MARKET_DISCOVERY_RETRY_SECS
@@ -364,11 +427,16 @@ impl MarketMonitor {
                 }
                 Err(e) => {
                     warn!("Market discovery error during init: {e}");
+                    if self.discovery_failure_since.is_none() {
+                        self.discovery_failure_since = Some(Instant::now());
+                    }
+                    let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
                     self.log_action(&format!(
                         "⚠️ Market discovery failed (retrying in {}s): {}",
-                        MARKET_DISCOVERY_RETRY_SECS, e
+                        MARKET_DISCOVERY_RETRY_SECS, reason
                     ))
                     .await;
+                    self.maybe_log_discovery_degraded().await;
                 }
             }
             tokio::time::sleep(Duration::from_secs(MARKET_DISCOVERY_RETRY_SECS)).await;
@@ -402,20 +470,10 @@ impl MarketMonitor {
     async fn recover_positions_from_trades(&mut self) {
         if let Some(ref mi) = self.market_info.clone() {
             if let Ok(trades) = self.client.get_trades(Some(&mi.condition_id)).await {
+                self.position = Position::default();
                 for trade in &trades {
-                    let size: f64 = trade.size.parse().unwrap_or(0.0);
-                    let price: f64 = trade.price.parse().unwrap_or(0.0);
-                    let cost = size * price;
-
-                    if trade.token_id == mi.tokens.yes {
-                        self.position.yes_size += size;
-                        self.position.yes_cost += cost;
-                        self.active_assets.insert(mi.tokens.yes.clone());
-                    } else if trade.token_id == mi.tokens.no {
-                        self.position.no_size += size;
-                        self.position.no_cost += cost;
-                        self.active_assets.insert(mi.tokens.no.clone());
-                    }
+                    self.mark_rest_trade_seen(&trade.id);
+                    let _ = self.apply_trade_record_to_position(trade, mi);
                 }
                 if self.position.yes_size > 0.01 || self.position.no_size > 0.01 {
                     self.note_position_activity();
@@ -494,6 +552,33 @@ impl MarketMonitor {
             .unwrap_or(true)
     }
 
+    fn clear_discovery_degraded_state(&mut self) {
+        self.discovery_failure_since = None;
+        self.last_discovery_degraded_warn_at = None;
+    }
+
+    async fn maybe_log_discovery_degraded(&mut self) {
+        let Some(first_failure) = self.discovery_failure_since else {
+            return;
+        };
+        if first_failure.elapsed().as_secs() < self.config.discovery_degraded_secs {
+            return;
+        }
+        let due = self
+            .last_discovery_degraded_warn_at
+            .map(|t| t.elapsed().as_secs() >= DISCOVERY_DEGRADED_WARN_INTERVAL_SECS)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_discovery_degraded_warn_at = Some(Instant::now());
+        self.log_action(&format!(
+            "⚠️ Discovery degraded >{}s: Gamma /events + /markets failing. Holding in retry mode.",
+            self.config.discovery_degraded_secs
+        ))
+        .await;
+    }
+
     async fn try_find_active_market_if_due(&mut self) {
         if self.market_info.is_some() || !self.market_discovery_due() {
             return;
@@ -502,9 +587,11 @@ impl MarketMonitor {
         self.last_market_discovery_attempt = Some(Instant::now());
         match self.find_active_market().await {
             Ok(true) => {
+                self.clear_discovery_degraded_state();
                 self.connect_ws_for_active_market(false).await;
             }
             Ok(false) => {
+                self.clear_discovery_degraded_state();
                 self.log_action(&format!(
                     "⏳ No active market yet. Retrying in {}s...",
                     MARKET_DISCOVERY_RETRY_SECS
@@ -513,11 +600,16 @@ impl MarketMonitor {
             }
             Err(e) => {
                 warn!("Market discovery error: {e}");
+                if self.discovery_failure_since.is_none() {
+                    self.discovery_failure_since = Some(Instant::now());
+                }
+                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
                 self.log_action(&format!(
                     "⚠️ Market discovery failed (retrying in {}s): {}",
-                    MARKET_DISCOVERY_RETRY_SECS, e
+                    MARKET_DISCOVERY_RETRY_SECS, reason
                 ))
                 .await;
+                self.maybe_log_discovery_degraded().await;
             }
         }
     }
@@ -703,6 +795,16 @@ impl MarketMonitor {
                 return;
             }
         };
+        self.last_yes_mid_price = yes_book
+            .best_bid()
+            .zip(Some(yes_ask))
+            .map(|(bid, ask)| (bid + ask) * 0.5)
+            .or(Some(yes_ask));
+        self.last_no_mid_price = no_book
+            .best_bid()
+            .zip(Some(no_ask))
+            .map(|(bid, ask)| (bid + ask) * 0.5)
+            .or(Some(no_ask));
         self.checks_total = self.checks_total.saturating_add(1);
 
         let total_cost = yes_ask + no_ask;
@@ -759,6 +861,13 @@ impl MarketMonitor {
                 self.fire_merge(amount, &mi).await;
             }
             // Do NOT return here! The bot can continue hunting for new arbs with remaining capital!
+        }
+
+        self.update_entry_lock_state();
+        if self.entry_lock_reason.is_some() {
+            self.log_entry_lock_if_needed().await;
+            self.request_render();
+            return;
         }
 
         if total_cost < effective_threshold {
@@ -825,11 +934,12 @@ impl MarketMonitor {
         
         let expected_profit = actual_payout_size * 1.0 - total_cost * size - gas_estimate;
 
-        if expected_profit < self.config.min_net_profit_usd {
+        let min_profit_usd = self.effective_min_profit_usd();
+        if expected_profit < min_profit_usd {
             self.checks_skipped_profit = self.checks_skipped_profit.saturating_add(1);
             self.log_action_fast(&format!(
                 "🧾 ORDER SEND: NO — expected net profit ${expected_profit:.3} is below threshold ${:.3}.",
-                self.config.min_net_profit_usd
+                min_profit_usd
             ));
             self.request_render();
             return;
@@ -907,7 +1017,7 @@ impl MarketMonitor {
         };
 
         let balance_size = balance / (yes_ask + no_ask);
-        let mut size = self.config.max_trade_size;
+        let mut size = self.effective_max_trade_size();
 
         if max_liq < size {
             self.log_action_fast(&format!(
@@ -1051,6 +1161,16 @@ impl MarketMonitor {
                             batches,
                             reason
                         ));
+                        abort_remaining = true;
+                    } else if err_msg.contains("marked ambiguous timeout") {
+                        self.log_action_fast(&format!(
+                            "⚠️ Batch {}/{}: ambiguous timeout — entry locked for deterministic recovery.",
+                            batch + 1,
+                            batches
+                        ));
+                        self.errors
+                            .push(format!("Batch {} ambiguous timeout: {}", batch + 1, err_msg));
+                        abort_remaining = true;
                     } else if err_msg.contains("stale opportunity dropped") {
                         let stale_reason = err_msg
                             .split("stale opportunity dropped:")
@@ -1151,10 +1271,11 @@ impl MarketMonitor {
         let recorded_pnl = if opportunity_success { total_profit } else { 0.0 };
         self.stats
             .record_execution(opportunity_success, recorded_pnl);
+        self.update_adaptive_stability_controls(opportunity_success);
 
         if opportunity_success {
             self.consecutive_failures = 0;
-            self.daily_pnl += total_profit;
+            self.record_execution_result(total_profit);
 
             if self.daily_pnl <= -self.config.max_daily_loss_usd {
                 let cooldown = Duration::from_millis(self.config.circuit_breaker_cooldown_ms);
@@ -1342,6 +1463,25 @@ impl MarketMonitor {
                         retry_idx + 1,
                         post_timeout_ms
                     );
+                    let timeout_detected_at = Utc::now();
+                    self.register_ambiguous_timeout_batch(
+                        &batch_id,
+                        mi,
+                        size,
+                        detect_ts,
+                        sign_start_ts,
+                        sign_end_ts,
+                        post_start_ts,
+                        timeout_detected_at,
+                        opp,
+                    );
+                    self.start_timeout_recovery_lock(&batch_id);
+                    self.log_action(&format!(
+                        "⛔ Timeout recovery lock engaged for batch {} ({}s window)",
+                        batch_id,
+                        self.config.timeout_recovery_lock_secs
+                    ))
+                    .await;
                     if let Err(e) = self
                         .run_network_call(
                             "cancel all orders after ambiguous post timeout",
@@ -1356,8 +1496,9 @@ impl MarketMonitor {
                             Self::format_error_chain(&e)
                         );
                     }
+                    self.run_timeout_recovery_flow(mi, opp, &batch_id).await;
                     anyhow::bail!(
-                        "post taker batch timed out after {}ms ({} attempt(s)); retries disabled for timeout ambiguity",
+                        "post taker batch timed out after {}ms ({} attempt(s)); marked ambiguous timeout and recovery lock engaged",
                         post_timeout_ms,
                         retry_idx + 1
                     );
@@ -1663,6 +1804,130 @@ impl MarketMonitor {
         );
     }
 
+    fn register_ambiguous_timeout_batch(
+        &mut self,
+        batch_id: &str,
+        mi: &MarketInfo,
+        size: f64,
+        detect_ts: chrono::DateTime<Utc>,
+        sign_start_ts: chrono::DateTime<Utc>,
+        sign_end_ts: chrono::DateTime<Utc>,
+        post_start_ts: chrono::DateTime<Utc>,
+        post_end_ts: chrono::DateTime<Utc>,
+        opp: &ArbOpportunity,
+    ) {
+        let now = Utc::now();
+        let yes_leg = OrderLegState {
+            token_id: mi.tokens.yes.clone(),
+            order_id: String::new(),
+            target_size: size,
+            matched_size: 0.0,
+            last_update_ts: now,
+        };
+        let no_leg = OrderLegState {
+            token_id: mi.tokens.no.clone(),
+            order_id: String::new(),
+            target_size: size,
+            matched_size: 0.0,
+            last_update_ts: now,
+        };
+        self.execution_batches.insert(
+            batch_id.to_string(),
+            ExecutionBatchState {
+                batch_id: batch_id.to_string(),
+                condition_id: mi.condition_id.clone(),
+                state: ExecutionState::AmbiguousTimeout,
+                yes_leg,
+                no_leg,
+                detect_ts,
+                sign_start_ts: Some(sign_start_ts),
+                sign_end_ts: Some(sign_end_ts),
+                post_start_ts: Some(post_start_ts),
+                post_end_ts: Some(post_end_ts),
+                first_fill_event_ts: None,
+                paired_complete_ts: None,
+                expected_pnl_usd: Some(size - (opp.total_cost * size) - self.gas_cache.fee_per_merge_usd),
+                realized_pnl_usd: None,
+            },
+        );
+    }
+
+    async fn run_timeout_recovery_flow(&mut self, mi: &MarketInfo, opp: &ArbOpportunity, batch_id: &str) {
+        let lock_secs = self.config.timeout_recovery_lock_secs.max(1);
+        let poll_ms = self.config.timeout_recovery_poll_ms.max(50);
+        let deadline = Instant::now() + Duration::from_secs(lock_secs);
+
+        while Instant::now() < deadline {
+            self.process_user_events().await;
+            let _ = self
+                .apply_rest_trade_deltas(mi, "timeout recovery")
+                .await;
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+        }
+
+        self.process_user_events().await;
+        let _ = self
+            .apply_rest_trade_deltas(mi, "timeout recovery finalization")
+            .await;
+
+        let (yes_ask, no_ask) = match self.fetch_books(mi).await {
+            Some((yes_book, no_book)) => {
+                let yes_mid = yes_book
+                    .best_bid()
+                    .zip(yes_book.best_ask())
+                    .map(|(bid, ask)| (bid + ask) * 0.5)
+                    .or_else(|| yes_book.best_ask())
+                    .unwrap_or(opp.yes_price);
+                let no_mid = no_book
+                    .best_bid()
+                    .zip(no_book.best_ask())
+                    .map(|(bid, ask)| (bid + ask) * 0.5)
+                    .or_else(|| no_book.best_ask())
+                    .unwrap_or(opp.no_price);
+                self.last_yes_mid_price = Some(yes_mid);
+                self.last_no_mid_price = Some(no_mid);
+                (
+                    yes_book.best_ask().unwrap_or(opp.yes_price),
+                    no_book.best_ask().unwrap_or(opp.no_price),
+                )
+            }
+            None => (opp.yes_price, opp.no_price),
+        };
+
+        if self.position.has_imbalance() {
+            self.handle_imbalance(mi, yes_ask, no_ask).await;
+        }
+        if self.mergeable_available() >= 1.0 {
+            self.fire_merge(self.mergeable_available(), mi).await;
+        }
+
+        self.timeout_recovery_active = false;
+        self.entry_lock_until = None;
+
+        let resolved = self.in_neutrality_resume_band() && !self.reconcile_drift_lock_active();
+        if resolved {
+            self.unresolved_ambiguous_batches.remove(batch_id);
+            self.log_action(&format!(
+                "✅ Timeout recovery completed for batch {} — entry lock released",
+                batch_id
+            ))
+            .await;
+            if let Some(batch) = self.execution_batches.get_mut(batch_id) {
+                batch.state = if self.position.has_imbalance() {
+                    ExecutionState::Partial
+                } else {
+                    ExecutionState::Failed
+                };
+            }
+        } else {
+            self.log_action(&format!(
+                "⚠️ Timeout recovery ended with unresolved inventory (imbalance {:.3}); keeping entry lock active",
+                self.net_imbalance_shares()
+            ))
+            .await;
+        }
+    }
+
     fn update_order_fill_state(
         &mut self,
         order_id: &str,
@@ -1822,6 +2087,95 @@ impl MarketMonitor {
         }
     }
 
+    fn mark_rest_trade_seen(&mut self, trade_id: &str) -> bool {
+        if trade_id.is_empty() {
+            return true;
+        }
+        if self.seen_rest_trade_ids.contains(trade_id) {
+            return false;
+        }
+        let owned = trade_id.to_string();
+        self.seen_rest_trade_ids.insert(owned.clone());
+        self.rest_trade_id_queue.push_back(owned);
+        while self.rest_trade_id_queue.len() > MAX_SEEN_WS_TRADE_IDS {
+            if let Some(evicted) = self.rest_trade_id_queue.pop_front() {
+                self.seen_rest_trade_ids.remove(&evicted);
+            }
+        }
+        true
+    }
+
+    fn apply_trade_record_to_position(
+        &mut self,
+        trade: &crate::types::TradeRecord,
+        mi: &MarketInfo,
+    ) -> bool {
+        let trade_size = trade.size.parse::<f64>().unwrap_or(0.0);
+        let trade_price = trade.price.parse::<f64>().unwrap_or(0.0);
+        if trade_size <= 0.0 || trade_price <= 0.0 {
+            return false;
+        }
+
+        let side = trade.side.to_ascii_uppercase();
+        let (size_ref, cost_ref, asset_id) = if trade.token_id == mi.tokens.yes {
+            (
+                &mut self.position.yes_size,
+                &mut self.position.yes_cost,
+                mi.tokens.yes.clone(),
+            )
+        } else if trade.token_id == mi.tokens.no {
+            (
+                &mut self.position.no_size,
+                &mut self.position.no_cost,
+                mi.tokens.no.clone(),
+            )
+        } else {
+            return false;
+        };
+
+        let applied = Self::apply_position_trade_delta(size_ref, cost_ref, &side, trade_size, trade_price);
+        if applied > 0.0 {
+            self.active_assets.insert(asset_id);
+            self.note_position_activity();
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn apply_rest_trade_deltas(&mut self, mi: &MarketInfo, reason: &str) -> usize {
+        let trades = match self.client.get_trades(Some(&mi.condition_id)).await {
+            Ok(mut t) => {
+                t.truncate(REST_RECOVERY_POLL_LOOKBACK_MAX_TRADES);
+                t
+            }
+            Err(e) => {
+                warn!(
+                    "REST trade delta poll failed during {reason}: {}",
+                    Self::format_error_chain(&e)
+                );
+                return 0;
+            }
+        };
+
+        let mut applied = 0usize;
+        for trade in trades {
+            if !self.mark_rest_trade_seen(&trade.id) {
+                continue;
+            }
+            if self.apply_trade_record_to_position(&trade, mi) {
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.log_action(&format!(
+                "⚠️ REST reconcile applied {applied} trade delta(s) during {reason}"
+            ))
+            .await;
+        }
+        applied
+    }
+
     // ─── Partial Fill / Hedge Logic ────────────────────────────────────────────
 
     async fn handle_partial_fill(
@@ -1902,6 +2256,144 @@ impl MarketMonitor {
         })
     }
 
+    async fn execute_buy_hedge_ladder(
+        &mut self,
+        missing_token_id: &str,
+        mi: &MarketInfo,
+        fee_rate_bps: u64,
+        missing_price: f64,
+        hedge_target_net: f64,
+        min_buy_size: f64,
+        context_label: &str,
+    ) -> Result<(f64, f64, f64, bool)> {
+        let tick = mi.tick_size.max(0.001);
+        let hedge_tif = Self::hedge_time_in_force();
+        let hedge_tif_label = Self::tif_label(hedge_tif).to_string();
+        let mut net_received_total = 0.0;
+        let mut gross_matched_total = 0.0;
+        let mut gross_cost_total = 0.0;
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for (idx, px_mult) in [1.03_f64, 1.06_f64].iter().enumerate() {
+            let remaining_target = (hedge_target_net - net_received_total).max(0.0);
+            if remaining_target <= 0.01 {
+                break;
+            }
+
+            let hedge_buy_price = Self::snap_price_to_tick(missing_price * px_mult, tick, true)
+                .min(1.0 - tick);
+            let Some(hedge_order_size) = self.gross_buy_size_for_target_net(
+                remaining_target,
+                hedge_buy_price,
+                min_buy_size,
+            ) else {
+                last_error = Some(anyhow!(
+                    "{} hedge target {:.2} cannot be represented with valid market BUY precision at {:.3}",
+                    context_label,
+                    remaining_target,
+                    hedge_buy_price
+                ));
+                continue;
+            };
+
+            let hedge_order = match self
+                .run_sdk_call(
+                    "sign ladder hedge order",
+                    self.client.sign_order(
+                        missing_token_id,
+                        hedge_buy_price,
+                        hedge_order_size,
+                        Side::Buy,
+                        hedge_tif,
+                        mi.neg_risk,
+                        fee_rate_bps,
+                    ),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            let post = self
+                .run_network_call(
+                    "post ladder hedge order",
+                    0,
+                    Self::env_u64("SDK_POST_TIMEOUT_MS", SDK_POST_TIMEOUT_MS),
+                    {
+                        let client = Arc::clone(&self.client);
+                        let mut maybe_order = Some(hedge_order);
+                        let tif = hedge_tif_label.clone();
+                        move || {
+                            let client = Arc::clone(&client);
+                            let tif = tif.clone();
+                            let order = maybe_order.take();
+                            async move {
+                                let order = order
+                                    .ok_or_else(|| anyhow!("ladder hedge order missing payload"))?;
+                                client.post_order(order, &tif).await
+                            }
+                        }
+                    },
+                )
+                .await;
+            let resp = match post {
+                Ok(v) => v,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            let matched = resp
+                .size_matched
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<f64>()
+                .unwrap_or(0.0);
+            if matched > 0.0 {
+                self.mark_response_fill_applied(&resp.order_id);
+                let net_received = self.fee_adjust_shares(matched, hedge_buy_price);
+                gross_matched_total += matched;
+                net_received_total += net_received;
+                gross_cost_total += matched * hedge_buy_price;
+                self.log_action(&format!(
+                    "✅ {} ladder fill A{}: gross {:.2} @ {:.2} (net +{:.2})",
+                    context_label,
+                    idx + 1,
+                    matched,
+                    hedge_buy_price,
+                    net_received
+                ))
+                .await;
+            } else {
+                self.log_action(&format!(
+                    "⏭ {} ladder A{} unfilled @ {:.2}",
+                    context_label,
+                    idx + 1,
+                    hedge_buy_price
+                ))
+                .await;
+            }
+
+            if idx == 0 && net_received_total + 0.01 < hedge_target_net {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+        }
+
+        if net_received_total <= 0.0 {
+            if let Some(err) = last_error {
+                return Err(err).context(format!("{context_label} ladder failed"));
+            }
+            anyhow::bail!("{context_label} ladder posted but remained unfilled");
+        }
+        let resolved = net_received_total + 0.01 >= hedge_target_net;
+        Ok((gross_matched_total, net_received_total, gross_cost_total, resolved))
+    }
+
     /// Decide whether to hedge (buy missing leg) or sell back (sell filled leg).
     async fn smart_hedge(
         &mut self,
@@ -1916,12 +2408,13 @@ impl MarketMonitor {
         filled_is_yes: bool,
     ) -> Result<f64> {
         let min_sell_size = Self::env_f64("MIN_SELL_RESCUE_SHARES", 5.0).max(5.0);
+        let min_buy_size = Self::env_f64("MIN_RESCUE_BUY_SHARES", 1.0).max(0.01);
         let order_size = ((size * 100.0).floor() / 100.0).max(0.0);
-        if order_size < min_sell_size {
+        if order_size < min_buy_size {
             anyhow::bail!(
-                "rescue size {:.3} below minimum sellable {:.1} shares",
+                "rescue size {:.3} below minimum hedge-buyable {:.2} shares",
                 order_size,
-                min_sell_size
+                min_buy_size
             );
         }
 
@@ -1930,17 +2423,47 @@ impl MarketMonitor {
         let sellable_size = ((self.fee_adjust_shares(order_size, filled_price).min(order_size) * 100.0).floor()
             / 100.0)
             .max(0.0);
-        let can_sell_back = sellable_size >= min_sell_size;
+        let mut can_sell_back = sellable_size >= min_sell_size;
+        if can_sell_back && !self.config.mock_currency {
+            let rpc = crate::clob_client::POLYGON_RPCS[0];
+            let holder = self.client.maker_address();
+            match self.client.get_ctf_balance(filled_token_id, holder, rpc).await {
+                Ok(on_chain) => {
+                    if on_chain + 0.01 < sellable_size {
+                        can_sell_back = false;
+                        self.log_action(&format!(
+                            "⏭ Rescue sell-back deferred: on-chain balance {:.2} < sellable {:.2} (relayer delay); forcing BUY hedge.",
+                            on_chain, sellable_size
+                        ))
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Rescue sell-back balance precheck failed (continuing): {}",
+                        Self::format_error_chain(&e)
+                    );
+                }
+            }
+        }
 
         // Estimate hedge and sell-back using live depth when available.
-        let mut expected_missing_cost = missing_price * order_size;
+        // Hedge BUY size must be grossed up so post-fee received shares match
+        // the missing leg inventory.
+        let hedge_target_net = sellable_size.min(order_size).max(0.0);
+        let hedge_quote_size_for_estimate = self
+            .gross_buy_size_for_target_net(hedge_target_net, missing_price, min_buy_size)
+            .unwrap_or(order_size.max(min_buy_size));
+        let mut expected_missing_cost = missing_price * hedge_quote_size_for_estimate;
         let mut expected_sell_proceeds = filled_price * sellable_size * 0.95;
         if let Some((yes_book, no_book)) = self.fetch_books(mi).await {
             if missing_token_id == mi.tokens.yes {
-                expected_missing_cost = Self::estimate_buy_cost_from_book(&yes_book, order_size)
+                expected_missing_cost =
+                    Self::estimate_buy_cost_from_book(&yes_book, hedge_quote_size_for_estimate)
                     .unwrap_or(expected_missing_cost);
             } else {
-                expected_missing_cost = Self::estimate_buy_cost_from_book(&no_book, order_size)
+                expected_missing_cost =
+                    Self::estimate_buy_cost_from_book(&no_book, hedge_quote_size_for_estimate)
                     .unwrap_or(expected_missing_cost);
             }
             if filled_token_id == mi.tokens.yes && sellable_size > 0.0 {
@@ -1953,8 +2476,9 @@ impl MarketMonitor {
         }
 
         // Hedge P&L: buy missing leg and merge.
-        let actual_size_missing = self.fee_adjust_shares(order_size, missing_price);
-        let actual_size_filled = self.fee_adjust_shares(order_size, filled_price);
+        let actual_size_missing =
+            self.fee_adjust_shares(hedge_quote_size_for_estimate, missing_price);
+        let actual_size_filled = hedge_target_net;
         let mergeable = actual_size_missing.min(actual_size_filled);
         let hedge_pnl = mergeable * 1.0
             - filled_cost
@@ -1969,11 +2493,7 @@ impl MarketMonitor {
         };
         let sell_pnl = expected_sell_proceeds - sell_cost_basis;
 
-        let force_buy_mode = self
-            .force_buy_hedge_until
-            .map(|until| Instant::now() < until)
-            .unwrap_or(false);
-        let sold_back = !force_buy_mode && can_sell_back && sell_pnl >= hedge_pnl;
+        let sold_back = can_sell_back && sell_pnl >= hedge_pnl;
         if !can_sell_back {
             self.log_action(&format!(
                 "⏭ Rescue sell-back skipped: sellable {:.3} < min {:.1} shares; forcing BUY hedge.",
@@ -1981,16 +2501,14 @@ impl MarketMonitor {
             ))
             .await;
         }
-        if force_buy_mode {
-            self.log_action("⏭ Rescue sell-back temporarily disabled after balance/allowance rejection; forcing BUY hedge.")
-                .await;
-        }
         let tick = mi.tick_size.max(0.001);
 
         let result = if sold_back {
             // Sell back filled leg
             let sell_back_price = Self::snap_price_to_tick(filled_price * 0.99, tick, false)
                 .max(tick);
+            let hedge_tif = Self::hedge_time_in_force();
+            let hedge_tif_label = Self::tif_label(hedge_tif);
             let sell_order = self
                 .run_sdk_call(
                     "sign sell-back order",
@@ -1999,7 +2517,7 @@ impl MarketMonitor {
                         sell_back_price,
                         sellable_size,
                         Side::Sell,
-                        TimeInForce::Fok,
+                        hedge_tif,
                         mi.neg_risk,
                         fee_rate_bps,
                     ),
@@ -2009,13 +2527,15 @@ impl MarketMonitor {
                 .run_network_call("post sell-back order", 0, Self::env_u64("SDK_POST_TIMEOUT_MS", SDK_POST_TIMEOUT_MS), {
                     let client = Arc::clone(&self.client);
                     let mut maybe_order = Some(sell_order);
+                    let tif = hedge_tif_label.to_string();
                     move || {
                         let client = Arc::clone(&client);
+                        let tif = tif.clone();
                         let order = maybe_order.take();
                         async move {
                             let order =
                                 order.ok_or_else(|| anyhow!("sell-back order missing payload"))?;
-                            client.post_order(order, "FOK").await
+                            client.post_order(order, &tif).await
                         }
                     }
                 })
@@ -2024,12 +2544,9 @@ impl MarketMonitor {
                 Ok(resp) => resp,
                 Err(e) => {
                     if Self::is_balance_allowance_rejection(&e) {
-                        self.force_buy_hedge_until =
-                            Some(Instant::now() + Duration::from_secs(FORCE_BUY_HEDGE_WINDOW_SECS));
-                        self.log_action(&format!(
-                            "⚠️ Rescue sell-back rejected (balance/allowance). Switching to BUY hedge mode for {}s.",
-                            FORCE_BUY_HEDGE_WINDOW_SECS
-                        ))
+                        self.log_action(
+                            "⚠️ Rescue sell-back rejected (balance/allowance). Keeping normal smart-hedge mode.",
+                        )
                         .await;
                     }
                     return Err(e);
@@ -2043,7 +2560,6 @@ impl MarketMonitor {
                 anyhow::bail!("rescue sell-back posted but unfilled");
             }
             let proceeds = matched * sell_back_price;
-            self.force_buy_hedge_until = None;
             self.log_action(&format!(
                 "✅ Rescue sell-back fill: {matched:.2} @ {:.2}",
                 sell_back_price
@@ -2065,56 +2581,30 @@ impl MarketMonitor {
             proceeds - filled_cost
         } else {
             // Hedge: buy missing leg
-            let hedge_buy_price = Self::snap_price_to_tick(missing_price * 1.03, tick, true)
-                .min(1.0 - tick);
-            let hedge_order = self
-                .run_sdk_call(
-                    "sign hedge order",
-                    self.client.sign_order(
-                        missing_token_id,
-                        hedge_buy_price, // +3 ticks aggressive, snapped to tick size
-                        order_size,
-                        Side::Buy,
-                        TimeInForce::Fok,
-                        mi.neg_risk,
-                        fee_rate_bps,
-                    ),
+            let (gross_hedge_matched, hedge_received, gross_hedge_cost, resolved) = self
+                .execute_buy_hedge_ladder(
+                    missing_token_id,
+                    mi,
+                    fee_rate_bps,
+                    missing_price,
+                    hedge_target_net,
+                    min_buy_size,
+                    "Rescue",
                 )
                 .await?;
-            let resp = self
-                .run_network_call("post hedge order", 0, Self::env_u64("SDK_POST_TIMEOUT_MS", SDK_POST_TIMEOUT_MS), {
-                    let client = Arc::clone(&self.client);
-                    let mut maybe_order = Some(hedge_order);
-                    move || {
-                        let client = Arc::clone(&client);
-                        let order = maybe_order.take();
-                        async move {
-                            let order = order.ok_or_else(|| anyhow!("hedge order missing payload"))?;
-                            client.post_order(order, "FOK").await
-                        }
-                    }
-                })
-                .await?;
-            let matched = resp.size_matched.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-            if matched > 0.0 {
-                self.mark_response_fill_applied(&resp.order_id);
-            }
-            if matched <= 0.0 {
-                anyhow::bail!("rescue hedge posted but unfilled");
-            }
-            self.force_buy_hedge_until = None;
+            let paired_size = hedge_received.min(hedge_target_net);
             self.log_action(&format!(
-                "✅ Rescue hedge fill: {matched:.2} @ {:.2}",
-                hedge_buy_price
+                "✅ Rescue hedge fill: gross {:.2} (net +{hedge_received:.2})",
+                gross_hedge_matched,
             ))
             .await;
 
             if filled_is_yes {
-                self.position.yes_size += matched;
-                self.position.no_size += matched;
+                self.position.yes_size += paired_size;
+                self.position.no_size += paired_size;
             } else {
-                self.position.no_size += matched;
-                self.position.yes_size += matched;
+                self.position.no_size += paired_size;
+                self.position.yes_size += paired_size;
             }
             self.note_position_activity();
             self.active_assets.insert(mi.tokens.yes.clone());
@@ -2123,22 +2613,30 @@ impl MarketMonitor {
             self.fire_merge(fire_amount, mi).await;
             self.stats.record_hedge();
 
-            let actual_matched_missing = self.fee_adjust_shares(matched, missing_price);
-            let actual_matched_filled = self.fee_adjust_shares(matched, filled_price);
+            let actual_matched_missing = hedge_received;
+            let actual_matched_filled = hedge_target_net;
             let actual_mergeable = actual_matched_missing.min(actual_matched_filled);
-            let actual_hedge_pnl = actual_mergeable * 1.0 - filled_cost - matched * missing_price - self.gas_cache.fee_per_merge_usd;
+            let actual_hedge_pnl =
+                actual_mergeable * 1.0 - filled_cost - gross_hedge_cost - self.gas_cache.fee_per_merge_usd;
             self.trade_logger
                 .log_hedge(
                     &mi.condition_id,
                     Some(&mi.question),
-                    matched,
-                    filled_cost + matched * missing_price,
+                    actual_mergeable,
+                    filled_cost + gross_hedge_cost,
                     actual_hedge_pnl,
                     false,
                     true,
                     None,
                 )
                 .await;
+            if !resolved {
+                anyhow::bail!(
+                    "rescue ladder unresolved: net {:.2}/{:.2} filled",
+                    hedge_received,
+                    hedge_target_net
+                );
+            }
             actual_hedge_pnl
         };
 
@@ -2180,15 +2678,16 @@ impl MarketMonitor {
                 )
             };
 
-        let min_imbalance_size = Self::env_f64("MIN_IMBALANCE_HEDGE_SIZE", 5.0).max(5.0);
-        let mut size = yes_excess.abs().min(self.config.max_trade_size);
+        let min_sell_size = Self::env_f64("MIN_IMBALANCE_SELL_SHARES", 5.0).max(5.0);
+        let min_buy_size = Self::env_f64("MIN_IMBALANCE_BUY_SHARES", 1.0).max(0.01);
+        let mut size = yes_excess.abs().min(self.effective_max_trade_size());
         size = (size * 100.0).floor() / 100.0;
-        if size < min_imbalance_size {
+        if size < min_buy_size {
             self.hedge_cooldown_until = Some(Instant::now() + Duration::from_secs(IMBALANCE_DUST_RECHECK_SECS));
             self.log_action(&format!(
-                "⏭ Imbalance {:.3} below min tradable {:.2}; keeping naked {} dust and retrying in {}s.",
+                "⏭ Imbalance {:.3} below min hedge-buy {:.2}; keeping naked {} dust and retrying in {}s.",
                 size,
-                min_imbalance_size,
+                min_buy_size,
                 if yes_excess > 0.0 { "UP" } else { "DOWN" },
                 IMBALANCE_DUST_RECHECK_SECS
             ))
@@ -2207,14 +2706,20 @@ impl MarketMonitor {
         };
         let filled_cost_basis = avg_filled_cost * size;
 
-        let mut expected_missing_cost = missing_price * size;
+        let hedge_target_net = size;
+        let hedge_quote_size_for_estimate = self
+            .gross_buy_size_for_target_net(hedge_target_net, missing_price, min_buy_size)
+            .unwrap_or(size.max(min_buy_size));
+        let mut expected_missing_cost = missing_price * hedge_quote_size_for_estimate;
         let mut expected_sell_proceeds = filled_price * size * 0.95;
         if let Some((yes_book, no_book)) = self.fetch_books(mi).await {
             if missing_token == &mi.tokens.yes {
-                expected_missing_cost = Self::estimate_buy_cost_from_book(&yes_book, size)
+                expected_missing_cost =
+                    Self::estimate_buy_cost_from_book(&yes_book, hedge_quote_size_for_estimate)
                     .unwrap_or(expected_missing_cost);
             } else {
-                expected_missing_cost = Self::estimate_buy_cost_from_book(&no_book, size)
+                expected_missing_cost =
+                    Self::estimate_buy_cost_from_book(&no_book, hedge_quote_size_for_estimate)
                     .unwrap_or(expected_missing_cost);
             }
             if filled_token == &mi.tokens.yes {
@@ -2226,8 +2731,9 @@ impl MarketMonitor {
             }
         }
 
-        let actual_size_missing = self.fee_adjust_shares(size, missing_price);
-        let actual_size_filled = self.fee_adjust_shares(size, filled_price);
+        let actual_size_missing =
+            self.fee_adjust_shares(hedge_quote_size_for_estimate, missing_price);
+        let actual_size_filled = hedge_target_net;
         let mergeable = actual_size_missing.min(actual_size_filled);
         let hedge_pnl = mergeable * 1.0
             - filled_cost_basis
@@ -2235,24 +2741,35 @@ impl MarketMonitor {
             - self.gas_cache.fee_per_merge_usd;
         let sell_pnl = expected_sell_proceeds - filled_cost_basis;
         let sell_size = ((self.fee_adjust_shares(size, filled_price).min(size) * 100.0).floor() / 100.0).max(0.0);
-        let can_sell_back = sell_size >= min_imbalance_size;
-        let force_buy_mode = self
-            .force_buy_hedge_until
-            .map(|until| Instant::now() < until)
-            .unwrap_or(false);
-        let sell_back = !force_buy_mode && can_sell_back && sell_pnl >= hedge_pnl;
+        let mut can_sell_back = sell_size >= min_sell_size;
+        if can_sell_back && !self.config.mock_currency {
+            let rpc = crate::clob_client::POLYGON_RPCS[0];
+            let holder = self.client.maker_address();
+            match self.client.get_ctf_balance(filled_token, holder, rpc).await {
+                Ok(on_chain) => {
+                    if on_chain + 0.01 < sell_size {
+                        can_sell_back = false;
+                        self.log_action(&format!(
+                            "⏭ Imbalance sell-back deferred: on-chain balance {:.2} < sellable {:.2} (relayer delay); forcing BUY hedge.",
+                            on_chain, sell_size
+                        ))
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Imbalance sell-back balance precheck failed (continuing): {}",
+                        Self::format_error_chain(&e)
+                    );
+                }
+            }
+        }
+        let sell_back = can_sell_back && sell_pnl >= hedge_pnl;
 
         if !can_sell_back {
             self.log_action(&format!(
-                "⏭ Imbalance sell-back skipped: sellable {:.3} < min {:.1} shares; forcing BUY hedge.",
-                sell_size, min_imbalance_size
-            ))
-            .await;
-        }
-        if force_buy_mode {
-            self.log_action(&format!(
-                "⏭ Imbalance sell-back temporarily disabled for {}s after balance/allowance rejection; forcing BUY hedge.",
-                FORCE_BUY_HEDGE_WINDOW_SECS
+                "⏭ Imbalance sell-back skipped: sellable {:.3} < min {:.1} shares; using BUY hedge path.",
+                sell_size, min_sell_size
             ))
             .await;
         }
@@ -2271,6 +2788,8 @@ impl MarketMonitor {
 
         let tick = mi.tick_size.max(0.001);
         let fee_bps = self.cached_fee_rate_bps;
+        let hedge_tif = Self::hedge_time_in_force();
+        let hedge_tif_label = Self::tif_label(hedge_tif);
         if sell_back {
             let sell_back_price = Self::snap_price_to_tick(filled_price * 0.99, tick, false).max(tick);
             match self
@@ -2281,7 +2800,7 @@ impl MarketMonitor {
                         sell_back_price,
                         sell_size,
                         Side::Sell,
-                        TimeInForce::Fok,
+                        hedge_tif,
                         mi.neg_risk,
                         fee_bps,
                     ),
@@ -2296,13 +2815,15 @@ impl MarketMonitor {
                         {
                             let client = Arc::clone(&self.client);
                             let mut maybe_order = Some(order);
+                            let tif = hedge_tif_label.to_string();
                             move || {
                                 let client = Arc::clone(&client);
+                                let tif = tif.clone();
                                 let order = maybe_order.take();
                                 async move {
                                     let order = order
                                         .ok_or_else(|| anyhow!("imbalance sell-back order missing payload"))?;
-                                    client.post_order(order, "FOK").await
+                                    client.post_order(order, &tif).await
                                 }
                             }
                         },
@@ -2337,10 +2858,18 @@ impl MarketMonitor {
                             };
                             if reduced > 0.0 {
                                 self.note_position_activity();
+                                let avg_cost = if size > 0.0 {
+                                    filled_cost_basis / size
+                                } else {
+                                    0.0
+                                };
+                                let realized_cost = avg_cost * reduced;
+                                let proceeds = reduced * sell_back_price;
+                                self.hedge_sellback_pnl += proceeds - realized_cost;
+                                self.sync_daily_pnl_from_components();
                             }
                             self.consecutive_hedge_failures = 0;
                             self.hedge_cooldown_until = None;
-                            self.force_buy_hedge_until = None;
                             self.log_action(&format!(
                                 "✅ Imbalance sell-back fill: -{reduced:.2} {filled_label} @ {:.2}",
                                 sell_back_price
@@ -2358,13 +2887,10 @@ impl MarketMonitor {
                     Err(e) => {
                         warn!("Imbalance sell-back failed: {}", Self::format_error_chain(&e));
                         if Self::is_balance_allowance_rejection(&e) {
-                            self.force_buy_hedge_until =
-                                Some(Instant::now() + Duration::from_secs(FORCE_BUY_HEDGE_WINDOW_SECS));
                             self.hedge_cooldown_until = None;
-                            self.log_action(&format!(
-                                "⚠️ Imbalance sell-back rejected (balance/allowance). Switching to BUY hedge mode for {}s.",
-                                FORCE_BUY_HEDGE_WINDOW_SECS
-                            ))
+                            self.log_action(
+                                "⚠️ Imbalance sell-back rejected (balance/allowance). Keeping smart-hedge mode.",
+                            )
                             .await;
                         } else {
                             let cooldown_secs = self.on_hedge_failure();
@@ -2385,108 +2911,82 @@ impl MarketMonitor {
                 }
             }
         } else {
-            let hedge_price = Self::snap_price_to_tick(missing_price * 1.03, tick, true).min(1.0 - tick);
-            match self
-                .run_sdk_call(
-                    "sign imbalance hedge order",
-                    self.client.sign_order(
-                        missing_token,
-                        hedge_price,
-                        size,
-                        Side::Buy,
-                        TimeInForce::Fok,
-                        mi.neg_risk,
-                        fee_bps,
-                    ),
+            let (gross_hedge_matched, hedge_received, gross_hedge_cost, resolved) = match self
+                .execute_buy_hedge_ladder(
+                    missing_token,
+                    mi,
+                    fee_bps,
+                    missing_price,
+                    hedge_target_net,
+                    min_buy_size,
+                    "Imbalance",
                 )
                 .await
             {
-                Ok(order) => match self
-                    .run_network_call(
-                        "post imbalance hedge order",
-                        0,
-                        Self::env_u64("SDK_POST_TIMEOUT_MS", SDK_POST_TIMEOUT_MS),
-                        {
-                            let client = Arc::clone(&self.client);
-                            let mut maybe_order = Some(order);
-                            move || {
-                                let client = Arc::clone(&client);
-                                let order = maybe_order.take();
-                                async move {
-                                    let order =
-                                        order.ok_or_else(|| anyhow!("imbalance hedge order missing payload"))?;
-                                    client.post_order(order, "FOK").await
-                                }
-                            }
-                        },
-                    )
-                    .await
-                {
-                    Ok(resp) => {
-                        let matched = resp
-                            .size_matched
-                            .as_deref()
-                            .unwrap_or("0")
-                            .parse::<f64>()
-                            .unwrap_or(0.0);
-                        if matched > 0.0 {
-                            self.mark_response_fill_applied(&resp.order_id);
-                            let added = if yes_excess > 0.0 {
-                                self.active_assets.insert(mi.tokens.no.clone());
-                                Self::apply_position_trade_delta(
-                                    &mut self.position.no_size,
-                                    &mut self.position.no_cost,
-                                    "BUY",
-                                    matched,
-                                    hedge_price,
-                                )
-                            } else {
-                                self.active_assets.insert(mi.tokens.yes.clone());
-                                Self::apply_position_trade_delta(
-                                    &mut self.position.yes_size,
-                                    &mut self.position.yes_cost,
-                                    "BUY",
-                                    matched,
-                                    hedge_price,
-                                )
-                            };
-                            if added > 0.0 {
-                                self.note_position_activity();
-                            }
-                            self.consecutive_hedge_failures = 0;
-                            self.hedge_cooldown_until = None;
-                            self.force_buy_hedge_until = None;
-                            self.log_action(&format!(
-                                "✅ Imbalance hedge fill: +{added:.2} {}",
-                                missing_label
-                            ))
-                            .await;
-                        } else {
-                            let cooldown_secs = self.on_hedge_failure();
-                            self.log_action(&format!(
-                                "⚠️ Imbalance hedge posted but unfilled — cooldown {}s",
-                                cooldown_secs
-                            ))
-                            .await;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Hedge order failed: {}", Self::format_error_chain(&e));
-                        let cooldown_secs = self.on_hedge_failure();
-                        let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 160);
-                        self.log_action(&format!(
-                            "⚠️ Imbalance hedge failed ({}) — cooldown {}s",
-                            reason, cooldown_secs
-                        ))
-                        .await;
-                    }
-                },
+                Ok(v) => v,
                 Err(e) => {
-                    warn!("Hedge sign failed: {}", Self::format_error_chain(&e));
+                    warn!("Imbalance hedge failed: {}", Self::format_error_chain(&e));
+                    let cooldown_secs = self.on_hedge_failure();
                     let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 160);
-                    self.log_action(&format!("⚠️ Imbalance hedge sign failed ({reason})"))
-                        .await;
+                    self.log_action(&format!(
+                        "⚠️ Imbalance hedge failed ({}) — cooldown {}s",
+                        reason, cooldown_secs
+                    ))
+                    .await;
+                    return;
                 }
+            };
+
+            if hedge_received > 0.0 {
+                let effective_price = if hedge_received > 0.0 {
+                    gross_hedge_cost / hedge_received
+                } else {
+                    missing_price
+                };
+                let added = if yes_excess > 0.0 {
+                    self.active_assets.insert(mi.tokens.no.clone());
+                    Self::apply_position_trade_delta(
+                        &mut self.position.no_size,
+                        &mut self.position.no_cost,
+                        "BUY",
+                        hedge_received,
+                        effective_price,
+                    )
+                } else {
+                    self.active_assets.insert(mi.tokens.yes.clone());
+                    Self::apply_position_trade_delta(
+                        &mut self.position.yes_size,
+                        &mut self.position.yes_cost,
+                        "BUY",
+                        hedge_received,
+                        effective_price,
+                    )
+                };
+                if added > 0.0 {
+                    self.note_position_activity();
+                }
+                self.consecutive_hedge_failures = 0;
+                self.hedge_cooldown_until = None;
+                self.log_action(&format!(
+                    "✅ Imbalance hedge fill: +{added:.2} {} (gross {:.2})",
+                    missing_label, gross_hedge_matched
+                ))
+                .await;
+                if !resolved {
+                    let cooldown_secs = self.on_hedge_failure();
+                    self.log_action(&format!(
+                        "⚠️ Imbalance ladder unresolved: net {:.2}/{:.2} — cooldown {}s",
+                        hedge_received, hedge_target_net, cooldown_secs
+                    ))
+                    .await;
+                }
+            } else {
+                let cooldown_secs = self.on_hedge_failure();
+                self.log_action(&format!(
+                    "⚠️ Imbalance hedge posted but unfilled — cooldown {}s",
+                    cooldown_secs
+                ))
+                .await;
             }
         }
     }
@@ -2799,6 +3299,8 @@ impl MarketMonitor {
                         cid.clone(),
                         Instant::now() + Duration::from_secs(CLAIM_SUCCESS_SUPPRESSION_SECS),
                     );
+                    m.redemption_pnl += amount;
+                    m.sync_daily_pnl_from_components();
                     m.log_action(&format!(
                         "✅ Redemption confirmed: {} (${:.2}) tx={}",
                         question, amount, tx_hash
@@ -2872,8 +3374,11 @@ impl MarketMonitor {
 
         // Find next market (non-fatal if unavailable during a short gap)
         match self.find_active_market().await {
-            Ok(true) => {}
+            Ok(true) => {
+                self.clear_discovery_degraded_state();
+            }
             Ok(false) => {
+                self.clear_discovery_degraded_state();
                 self.log_action(&format!(
                     "⏳ No active market yet. Waiting for next window (retry {}s)...",
                     MARKET_DISCOVERY_RETRY_SECS
@@ -2883,11 +3388,16 @@ impl MarketMonitor {
             }
             Err(e) => {
                 warn!("Failed to find next market: {e}");
+                if self.discovery_failure_since.is_none() {
+                    self.discovery_failure_since = Some(Instant::now());
+                }
+                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
                 self.log_action(&format!(
                     "⚠️ Failed to discover next market (retry {}s): {}",
-                    MARKET_DISCOVERY_RETRY_SECS, e
+                    MARKET_DISCOVERY_RETRY_SECS, reason
                 ))
                 .await;
+                self.maybe_log_discovery_degraded().await;
                 return;
             }
         }
@@ -3369,6 +3879,195 @@ impl MarketMonitor {
         (self.position.mergeable_amount() - self.pending_merge_reserved_size).max(0.0)
     }
 
+    fn entry_lock_reason_label(reason: EntryLockReason) -> &'static str {
+        match reason {
+            EntryLockReason::Imbalance => "Imbalance",
+            EntryLockReason::TimeoutRecovery => "TimeoutRecovery",
+            EntryLockReason::AmbiguousFill => "AmbiguousFill",
+            EntryLockReason::ReconcileDrift => "ReconcileDrift",
+        }
+    }
+
+    fn net_imbalance_shares(&self) -> f64 {
+        (self.position.yes_size - self.position.no_size).abs()
+    }
+
+    fn in_neutrality_resume_band(&self) -> bool {
+        self.net_imbalance_shares() <= self.config.neutrality_resume_net_shares.max(0.0)
+    }
+
+    fn reconcile_drift_lock_active(&self) -> bool {
+        self.reconcile_drift_streak >= ENTRY_LOCK_RECONCILE_DRIFT_STREAK
+    }
+
+    fn effective_max_trade_size(&self) -> f64 {
+        self.adaptive_max_trade_size.max(ADAPTIVE_MIN_SIZE_FLOOR)
+    }
+
+    fn effective_min_profit_usd(&self) -> f64 {
+        self.adaptive_min_profit_usd.max(0.0)
+    }
+
+    fn sync_daily_pnl_from_components(&mut self) {
+        self.daily_pnl =
+            self.execution_pnl + self.hedge_sellback_pnl + self.redemption_pnl + self.fees_gas_estimate;
+    }
+
+    fn record_execution_result(&mut self, pnl: f64) {
+        self.execution_success_count = self.execution_success_count.saturating_add(1);
+        if pnl > 0.0 {
+            self.economic_success_count = self.economic_success_count.saturating_add(1);
+        }
+        self.execution_pnl += pnl;
+        self.sync_daily_pnl_from_components();
+    }
+
+    fn update_adaptive_stability_controls(&mut self, completed: bool) {
+        self.recent_opportunity_completion.push_back(completed);
+        while self.recent_opportunity_completion.len() > ADAPTIVE_WINDOW_SIZE {
+            self.recent_opportunity_completion.pop_front();
+        }
+        if self.recent_opportunity_completion.len() < ADAPTIVE_WINDOW_SIZE {
+            return;
+        }
+
+        let completed_count = self
+            .recent_opportunity_completion
+            .iter()
+            .filter(|x| **x)
+            .count() as f64;
+        let completion_ratio = completed_count / ADAPTIVE_WINDOW_SIZE as f64;
+        if completion_ratio >= ADAPTIVE_MIN_COMPLETION_RATIO {
+            return;
+        }
+
+        let prev_min_profit = self.adaptive_min_profit_usd;
+        let prev_max_size = self.adaptive_max_trade_size;
+        self.adaptive_min_profit_usd =
+            (self.adaptive_min_profit_usd + ADAPTIVE_MIN_PROFIT_STEP).min(ADAPTIVE_MIN_PROFIT_CAP);
+        self.adaptive_max_trade_size =
+            (self.adaptive_max_trade_size - ADAPTIVE_MAX_SIZE_STEP).max(ADAPTIVE_MIN_SIZE_FLOOR);
+
+        if (self.adaptive_min_profit_usd - prev_min_profit).abs() > f64::EPSILON
+            || (self.adaptive_max_trade_size - prev_max_size).abs() > f64::EPSILON
+        {
+            self.log_action_fast(&format!(
+                "🛡 Stability auto-tighten: completion {:.0}% over last {} opps → min profit ${:.2}, max size {:.0}",
+                completion_ratio * 100.0,
+                ADAPTIVE_WINDOW_SIZE,
+                self.adaptive_min_profit_usd,
+                self.adaptive_max_trade_size
+            ));
+        }
+    }
+
+    fn update_entry_lock_state(&mut self) {
+        if !self.config.strict_neutral_mode {
+            self.entry_lock_reason = None;
+            self.entry_lock_until = None;
+            self.timeout_recovery_active = false;
+            return;
+        }
+
+        let now = Instant::now();
+        if self.timeout_recovery_active {
+            if let Some(until) = self.entry_lock_until {
+                if now < until {
+                    self.entry_lock_reason = Some(EntryLockReason::TimeoutRecovery);
+                    return;
+                }
+            }
+            self.timeout_recovery_active = false;
+            self.entry_lock_until = None;
+        }
+
+        if !self.unresolved_ambiguous_batches.is_empty()
+            && self.in_neutrality_resume_band()
+            && !self.reconcile_drift_lock_active()
+        {
+            self.unresolved_ambiguous_batches.clear();
+        }
+
+        if !self.unresolved_ambiguous_batches.is_empty() {
+            self.entry_lock_reason = Some(EntryLockReason::AmbiguousFill);
+            return;
+        }
+
+        if !self.in_neutrality_resume_band() {
+            self.entry_lock_reason = Some(EntryLockReason::Imbalance);
+            return;
+        }
+
+        if self.reconcile_drift_lock_active() {
+            self.entry_lock_reason = Some(EntryLockReason::ReconcileDrift);
+            return;
+        }
+
+        self.entry_lock_reason = None;
+        self.entry_lock_until = None;
+    }
+
+    fn entry_lock_remaining_secs(&self) -> Option<u64> {
+        if self.entry_lock_reason != Some(EntryLockReason::TimeoutRecovery) {
+            return None;
+        }
+        self.entry_lock_until.map(|until| {
+            until
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+        })
+    }
+
+    async fn log_entry_lock_if_needed(&mut self) {
+        self.update_entry_lock_state();
+        let Some(reason) = self.entry_lock_reason else {
+            self.last_entry_lock_log_reason = None;
+            self.last_entry_lock_log_at = None;
+            return;
+        };
+
+        let now = Instant::now();
+        let reason_changed = self.last_entry_lock_log_reason != Some(reason);
+        let stale_log = self
+            .last_entry_lock_log_at
+            .map(|t| t.elapsed().as_secs() >= ENTRY_LOCK_LOG_INTERVAL_SECS)
+            .unwrap_or(true);
+        if !reason_changed && !stale_log {
+            return;
+        }
+
+        let reason_label = Self::entry_lock_reason_label(reason);
+        let msg = if let Some(remaining) = self.entry_lock_remaining_secs() {
+            format!(
+                "⛔ Entry locked: {} (resume in ~{}s) | imbalance {:.3}, ambiguous {}, drift streak {}",
+                reason_label,
+                remaining,
+                self.net_imbalance_shares(),
+                self.unresolved_ambiguous_batches.len(),
+                self.reconcile_drift_streak
+            )
+        } else {
+            format!(
+                "⛔ Entry locked: {} | imbalance {:.3}, ambiguous {}, drift streak {}",
+                reason_label,
+                self.net_imbalance_shares(),
+                self.unresolved_ambiguous_batches.len(),
+                self.reconcile_drift_streak
+            )
+        };
+        self.log_action(&msg).await;
+        self.last_entry_lock_log_reason = Some(reason);
+        self.last_entry_lock_log_at = Some(now);
+    }
+
+    fn start_timeout_recovery_lock(&mut self, batch_id: &str) {
+        self.timeout_recovery_active = true;
+        self.entry_lock_until =
+            Some(Instant::now() + Duration::from_secs(self.config.timeout_recovery_lock_secs.max(1)));
+        self.entry_lock_reason = Some(EntryLockReason::TimeoutRecovery);
+        self.unresolved_ambiguous_batches.insert(batch_id.to_string());
+    }
+
     fn estimate_buy_cost_from_book(book: &OrderBook, size: f64) -> Option<f64> {
         if size <= 0.0 {
             return Some(0.0);
@@ -3435,6 +4134,78 @@ impl MarketMonitor {
             .unwrap_or(default)
     }
 
+    /// Polymarket market-BUY validation can reject orders when quote notional has
+    /// unsupported precision. Pick the largest <= `max_size` that keeps notional
+    /// aligned to 2 decimal places (USDC cents), while respecting `min_size`.
+    fn quantize_market_buy_size(max_size: f64, price: f64, min_size: f64) -> Option<f64> {
+        if !max_size.is_finite() || !price.is_finite() || max_size <= 0.0 || price <= 0.0 {
+            return None;
+        }
+        let max_cents = (max_size * 100.0).floor() as i64;
+        let min_cents = (min_size * 100.0).ceil() as i64;
+        if max_cents < min_cents || min_cents <= 0 {
+            return None;
+        }
+
+        let step = Self::market_buy_step_cents(price)?;
+        let quantized_cents = (max_cents / step) * step;
+        if quantized_cents < min_cents {
+            return None;
+        }
+        Some(quantized_cents as f64 / 100.0)
+    }
+
+    /// Pick the smallest >= `min_size` that satisfies market-BUY quote precision.
+    fn quantize_market_buy_size_up(
+        min_size: f64,
+        price: f64,
+        min_order_size: f64,
+        max_size: f64,
+    ) -> Option<f64> {
+        if !min_size.is_finite()
+            || !max_size.is_finite()
+            || !price.is_finite()
+            || min_size <= 0.0
+            || max_size <= 0.0
+            || price <= 0.0
+        {
+            return None;
+        }
+        let floor_min = min_size.max(min_order_size);
+        let min_cents = (floor_min * 100.0).ceil() as i64;
+        let max_cents = (max_size * 100.0).floor() as i64;
+        if max_cents < min_cents || min_cents <= 0 {
+            return None;
+        }
+        let step = Self::market_buy_step_cents(price)?;
+        let quantized_cents = ((min_cents + step - 1) / step) * step;
+        if quantized_cents > max_cents {
+            return None;
+        }
+        Some(quantized_cents as f64 / 100.0)
+    }
+
+    fn market_buy_step_cents(price: f64) -> Option<i64> {
+        if !price.is_finite() || price <= 0.0 {
+            return None;
+        }
+        let price_cents = ((price * 100.0).round() as i64).max(1) as u64;
+        let step = (100_u64 / Self::gcd_u64(price_cents, 100_u64)) as i64;
+        if step <= 0 {
+            return None;
+        }
+        Some(step)
+    }
+
+    fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        a.max(1)
+    }
+
     fn snap_price_to_tick(price: f64, tick_size: f64, round_up: bool) -> f64 {
         let tick = tick_size.max(0.0001);
         let ratio = (price / tick).max(0.0);
@@ -3477,6 +4248,24 @@ impl MarketMonitor {
     }
 
     fn taker_tif_label(tif: TimeInForce) -> &'static str {
+        Self::tif_label(tif)
+    }
+
+    fn hedge_time_in_force() -> TimeInForce {
+        match std::env::var("HEDGE_ORDER_TYPE")
+            .unwrap_or_else(|_| "FAK".to_string())
+            .trim()
+            .to_uppercase()
+            .as_str()
+        {
+            "FOK" => TimeInForce::Fok,
+            "GTC" => TimeInForce::Gtc,
+            "GTD" => TimeInForce::Gtd,
+            _ => TimeInForce::Fak,
+        }
+    }
+
+    fn tif_label(tif: TimeInForce) -> &'static str {
         match tif {
             TimeInForce::Fok => "FOK",
             TimeInForce::Fak => "FAK",
@@ -3603,7 +4392,7 @@ impl MarketMonitor {
         let effective_threshold = 1.0 - fee_yes.max(fee_no);
         let edge_per_share = effective_threshold - (yes_best + no_best);
         let profit_ref_size = opportunity_size.max(size).max(1.0);
-        let min_edge_per_share = self.config.min_net_profit_usd / profit_ref_size;
+        let min_edge_per_share = self.effective_min_profit_usd() / profit_ref_size;
         if edge_per_share < min_edge_per_share {
             anyhow::bail!(
                 "stale opportunity dropped: edge {:.4}/share below min {:.4}/share after revalidation",
@@ -4128,8 +4917,58 @@ impl MarketMonitor {
         (actual * 100.0).floor() / 100.0
     }
 
+    /// Compute a market-BUY order size that aims to deliver `target_net_shares`
+    /// after taker fee, while satisfying quote-precision constraints.
+    fn gross_buy_size_for_target_net(
+        &self,
+        target_net_shares: f64,
+        price: f64,
+        min_order_size: f64,
+    ) -> Option<f64> {
+        if !target_net_shares.is_finite() || !price.is_finite() || target_net_shares <= 0.0 || price <= 0.0 {
+            return None;
+        }
+
+        let active_fee_rate = if self.cached_fee_rate_bps > 0 {
+            self.config.clob_fee_rate
+        } else {
+            0.0
+        };
+        let effective_fee =
+            active_fee_rate * (price * (1.0 - price)).powf(self.config.clob_fee_exponent);
+        let denom = (1.0 - effective_fee).max(0.000_001);
+        let gross_needed = (target_net_shares / denom).max(min_order_size);
+
+        let down = Self::quantize_market_buy_size(gross_needed, price, min_order_size);
+        let up = Self::quantize_market_buy_size_up(
+            gross_needed,
+            price,
+            min_order_size,
+            gross_needed + 2.0,
+        );
+
+        let mut best: Option<(f64, f64)> = None; // (order_size, absolute net error)
+        for candidate in [down, up].into_iter().flatten() {
+            let est_net = self.fee_adjust_shares(candidate, price);
+            let err = (est_net - target_net_shares).abs();
+            match best {
+                None => best = Some((candidate, err)),
+                Some((best_size, best_err)) => {
+                    let better = err + 1e-9 < best_err
+                        || ((err - best_err).abs() <= 1e-9 && candidate < best_size);
+                    if better {
+                        best = Some((candidate, err));
+                    }
+                }
+            }
+        }
+
+        best.map(|(size, _)| size)
+    }
+
     /// Render the TUI dashboard with current state.
     fn render_dashboard(&mut self) {
+        self.update_entry_lock_state();
         let mi = self.market_info.as_ref();
         let wallet_addr = format!("{}", self.client.maker_address());
         let wallet_type = if self.config.uses_proxy() {
@@ -4154,6 +4993,25 @@ impl MarketMonitor {
             }
         }
 
+        let pairs = self.position.yes_size.min(self.position.no_size);
+        let carry_naked_yes = (self.position.yes_size - pairs).max(0.0);
+        let carry_naked_no = (self.position.no_size - pairs).max(0.0);
+        let yes_mark = self.last_yes_mid_price.unwrap_or_else(|| {
+            if self.position.yes_size > 0.0 {
+                self.position.yes_cost / self.position.yes_size
+            } else {
+                0.0
+            }
+        });
+        let no_mark = self.last_no_mid_price.unwrap_or_else(|| {
+            if self.position.no_size > 0.0 {
+                self.position.no_cost / self.position.no_size
+            } else {
+                0.0
+            }
+        });
+        let carry_worst_case_loss = (carry_naked_yes * yes_mark).max(carry_naked_no * no_mark);
+
         let state = DashboardState {
             market_slug: &self.config.market_slugs.join(","),
             market_question: mi.map(|m| m.question.as_str()),
@@ -4171,6 +5029,18 @@ impl MarketMonitor {
             session_start_balance: self.session_start_balance,
             session_successes: self.session_successes(),
             session_failures: self.session_failures(),
+            daily_pnl: self.daily_pnl,
+            execution_pnl: self.execution_pnl,
+            hedge_sellback_pnl: self.hedge_sellback_pnl,
+            redemption_pnl: self.redemption_pnl,
+            fees_gas_estimate: self.fees_gas_estimate,
+            execution_success_count: self.execution_success_count,
+            economic_success_count: self.economic_success_count,
+            carry_naked_yes,
+            carry_naked_no,
+            carry_worst_case_loss,
+            entry_lock_reason: self.entry_lock_reason.map(Self::entry_lock_reason_label),
+            entry_lock_remaining_secs: self.entry_lock_remaining_secs(),
             circuit_breaker_active: cb_active,
             circuit_breaker_remaining_secs: cb_remaining,
             data_source: &self.last_data_source,
@@ -4236,6 +5106,11 @@ mod tests {
         cfg.gtc_taker_timeout_ms = 5_000;
         cfg.ws_fill_primary = true;
         cfg.ws_fill_fallback_poll_ms = 300;
+        cfg.strict_neutral_mode = true;
+        cfg.neutrality_resume_net_shares = 0.25;
+        cfg.timeout_recovery_lock_secs = 10;
+        cfg.timeout_recovery_poll_ms = 200;
+        cfg.discovery_degraded_secs = 60;
         cfg.adaptive_throttle_min_ms = 0;
         cfg.adaptive_throttle_burst_debounce_ms = 8;
         cfg.actionable_delta_min_ticks = 1;
@@ -4268,8 +5143,20 @@ mod tests {
             session_successes_baseline: 0,
             session_failures_baseline: 0,
             daily_pnl: 0.0,
+            execution_pnl: 0.0,
+            hedge_sellback_pnl: 0.0,
+            redemption_pnl: 0.0,
+            fees_gas_estimate: 0.0,
+            execution_success_count: 0,
+            economic_success_count: 0,
             consecutive_failures: 0,
             circuit_breaker_until: None,
+            entry_lock_until: None,
+            entry_lock_reason: None,
+            timeout_recovery_active: false,
+            unresolved_ambiguous_batches: HashSet::new(),
+            last_entry_lock_log_reason: None,
+            last_entry_lock_log_at: None,
             hedge_cooldown_until: None,
             consecutive_hedge_failures: 0,
             active_assets: HashSet::new(),
@@ -4278,6 +5165,8 @@ mod tests {
             last_merge_attempt: None,
             last_claim_poll: None,
             last_market_discovery_attempt: None,
+            discovery_failure_since: None,
+            last_discovery_degraded_warn_at: None,
             force_claim_scan: false,
             last_check: None,
             errors: Vec::new(),
@@ -4336,7 +5225,13 @@ mod tests {
             response_applied_order_queue: VecDeque::with_capacity(MAX_RESPONSE_APPLIED_ORDER_IDS + 1),
             last_position_activity_at: None,
             reconcile_drift_streak: 0,
-            force_buy_hedge_until: None,
+            adaptive_min_profit_usd: config.min_net_profit_usd,
+            adaptive_max_trade_size: config.max_trade_size,
+            recent_opportunity_completion: VecDeque::new(),
+            last_yes_mid_price: None,
+            last_no_mid_price: None,
+            seen_rest_trade_ids: HashSet::new(),
+            rest_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
         })
     }
 
@@ -4379,6 +5274,39 @@ mod tests {
         assert_eq!(size, 50.0);
     }
 
+    #[test]
+    fn test_quantize_market_buy_size_aligns_quote_precision() {
+        // At 0.53 price, 6.15 shares implies $3.2595 quote (4 dp) and is rejected.
+        // Quantizer should snap down to an integer share amount so quote is 2 dp.
+        let q = MarketMonitor::quantize_market_buy_size(6.15, 0.53, 5.0);
+        assert_eq!(q, Some(6.0));
+
+        // If max size cannot satisfy min size after quantization, return None.
+        let q2 = MarketMonitor::quantize_market_buy_size(5.49, 0.53, 5.5);
+        assert_eq!(q2, None);
+    }
+
+    #[test]
+    fn test_quantize_market_buy_size_up_aligns_quote_precision() {
+        // At 0.53, valid market-BUY sizes are integer shares.
+        let q = MarketMonitor::quantize_market_buy_size_up(6.15, 0.53, 5.0, 7.2);
+        assert_eq!(q, Some(7.0));
+    }
+
+    #[tokio::test]
+    async fn test_gross_buy_size_for_target_net_is_fee_aware() {
+        let Some(monitor) = mock_monitor().await else {
+            return;
+        };
+        let target_net = 5.40;
+        let Some(order_size) = monitor.gross_buy_size_for_target_net(target_net, 0.50, 5.0) else {
+            panic!("expected a valid fee-aware order size");
+        };
+        let net_estimate = monitor.fee_adjust_shares(order_size, 0.50);
+        // Fee-aware helper should not under-order versus target by more than 0.02 (size precision floor).
+        assert!(net_estimate + 0.020_001 >= target_net);
+    }
+
     #[tokio::test]
     async fn test_calculate_size_balance_capped() {
         let Some(mut monitor) = mock_monitor().await else {
@@ -4388,6 +5316,7 @@ mod tests {
             max_trade_size: 5000.0,
             ..(*monitor.config).clone()
         });
+        monitor.adaptive_max_trade_size = 5000.0;
         
         // Mock currency is set to true in monitor.
         // The mock balance is hardcoded to 1000.0 in `calculate_size` when `mock_currency == true`.
@@ -4546,7 +5475,8 @@ mod tests {
         monitor.stats.stats.successes = 2;
         monitor.stats.stats.failures = 5;
         monitor.stats.stats.total_pnl_usd = 1.0;
-        monitor.daily_pnl = 0.3;
+        monitor.execution_pnl = 0.3;
+        monitor.sync_daily_pnl_from_components();
 
         let (success, recorded_pnl) = monitor.finalize_opportunity_outcome(3, 2, 0.7);
 
@@ -4558,6 +5488,8 @@ mod tests {
         assert_eq!(monitor.stats.stats.failures, 5);
         assert!((monitor.stats.stats.total_pnl_usd - 1.7).abs() < 1e-9);
         assert!((monitor.daily_pnl - 1.0).abs() < 1e-9);
+        assert_eq!(monitor.execution_success_count, 1);
+        assert_eq!(monitor.economic_success_count, 1);
     }
 
     #[tokio::test]
@@ -4580,5 +5512,65 @@ mod tests {
         assert_eq!(monitor.stats.stats.total_arb_executions, 21);
         assert_eq!(monitor.stats.stats.failures, 11);
         assert!(monitor.circuit_breaker_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_entry_lock_engages_on_imbalance() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.position.yes_size = 3.0;
+        monitor.position.no_size = 1.0;
+        monitor.position.yes_cost = 1.2;
+        monitor.position.no_cost = 0.4;
+
+        monitor.update_entry_lock_state();
+        assert_eq!(monitor.entry_lock_reason, Some(EntryLockReason::Imbalance));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_entry_lock_releases_after_window_when_neutral() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.timeout_recovery_active = true;
+        monitor.entry_lock_until = Some(Instant::now() - Duration::from_millis(5));
+        monitor.unresolved_ambiguous_batches.clear();
+        monitor.position = Position::default();
+        monitor.reconcile_drift_streak = 0;
+
+        monitor.update_entry_lock_state();
+        assert_eq!(monitor.entry_lock_reason, None);
+        assert!(!monitor.timeout_recovery_active);
+    }
+
+    #[tokio::test]
+    async fn test_execution_success_counter_vs_economic_success_counter() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        let (success, recorded_pnl) = monitor.finalize_opportunity_outcome(1, 1, -0.15);
+        assert!(success);
+        assert_eq!(recorded_pnl, -0.15);
+        assert_eq!(monitor.execution_success_count, 1);
+        assert_eq!(monitor.economic_success_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pnl_components_sum_to_daily_pnl() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.execution_pnl = 1.25;
+        monitor.hedge_sellback_pnl = -0.40;
+        monitor.redemption_pnl = 0.90;
+        monitor.fees_gas_estimate = -0.15;
+        monitor.sync_daily_pnl_from_components();
+
+        let expected = monitor.execution_pnl
+            + monitor.hedge_sellback_pnl
+            + monitor.redemption_pnl
+            + monitor.fees_gas_estimate;
+        assert!((monitor.daily_pnl - expected).abs() < 1e-9);
     }
 }

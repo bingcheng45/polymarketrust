@@ -8,6 +8,8 @@ A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScr
 - **Event-driven fill tracking** — User WS events are primary for fills with stale-poll fallback
 - **GTC batched execution** — signs both legs concurrently and submits paired legs with harder-to-fill-first ordering
 - **Partial-fill recovery** — smart hedge-or-sell-back when only one leg fills
+- **Strict-neutral entry lock** — new entries are blocked until inventory ambiguity/imbalance is resolved
+- **Hard timeout recovery lock** — ambiguous submit timeouts trigger deterministic recovery before resuming
 - **WebSocket orderbook feed** — real-time updates from Polymarket's WS API with REST fallback
 - **Maker mode** — optional GTC limit orders posted below best ask instead of FOK taker orders
 - **Dynamic fee calculation** — `fee = CLOB_FEE_RATE × (price × (1 − price))^CLOB_FEE_EXPONENT`
@@ -64,23 +66,35 @@ Key parameters:
 | Variable | Default | Description |
 |---|---|---|
 | `MARKET_SLUG` | `btc-updown-15m` | Market slug prefix (comma-separated for multi-market) |
-| `MAX_TRADE_SIZE` | `50` | Max shares per arb execution |
+| `MAX_TRADE_SIZE` | `12` | Max shares per arb execution (stability-first) |
 | `MIN_PAIRED_SHARES` | `5` | Minimum paired size required after fee adjustment |
 | `MIN_CHILD_ORDER_SIZE` | `5` | Minimum child slice size for taker batching |
-| `TARGET_CHILD_ORDER_SIZE` | `5` | Target child slice size for taker batching |
-| `MAX_TAKER_BATCHES` | `8` | Upper bound on child slices per opportunity |
-| `MIN_NET_PROFIT_USD` | `0.05` | Minimum profit threshold |
+| `TARGET_CHILD_ORDER_SIZE` | `12` | Target child slice size for taker batching |
+| `MAX_TAKER_BATCHES` | `1` | Upper bound on child slices per opportunity |
+| `MIN_RESCUE_BUY_SHARES` | `1` | Minimum BUY hedge size for partial-fill rescue paths |
+| `MIN_IMBALANCE_BUY_SHARES` | `1` | Minimum BUY hedge size for imbalance neutralization |
+| `MIN_IMBALANCE_SELL_SHARES` | `5` | Minimum SELL hedge size for imbalance sell-back paths |
+| `MIN_NET_PROFIT_USD` | `0.08` | Minimum profit threshold |
+| `STRICT_NEUTRAL_MODE` | `true` | Block new entries while imbalance/recovery lock is active |
+| `NEUTRALITY_RESUME_NET_SHARES` | `0.25` | Resume only when net imbalance is at or below this |
+| `TIMEOUT_RECOVERY_LOCK_SECS` | `10` | Lock duration for post-timeout deterministic recovery |
+| `TIMEOUT_RECOVERY_POLL_MS` | `200` | Poll cadence during timeout recovery |
+| `MIN_LEG_PRICE` | `0.12` | Skip opportunities with near-resolved legs |
 | `MOCK_CURRENCY` | `false` | Paper trading mode (no real orders) |
 | `WS_ENABLED` | `true` | Enable WebSocket feed |
 | `MAKER_MODE_ENABLED` | `false` | Use GTC resting maker orders instead of immediate taker |
 | `TAKER_ORDER_TYPE` | `FAK` | Immediate taker type (`FAK` or `FOK`) |
-| `PRE_SUBMIT_SIGNAL_MAX_AGE_MS` | `450` | Drop stale opportunities before order submit |
-| `PRE_SUBMIT_PAIR_DRIFT_MAX` | `0.01` | Max allowed pair-cost drift before submit |
-| `PRE_SUBMIT_MIN_LIQ_FACTOR` | `0.90` | Min depth fraction required at submit time |
+| `HEDGE_ORDER_TYPE` | `FAK` | Hedge/sell-back order type (`FAK` preferred for stability) |
+| `PRE_SUBMIT_SIGNAL_MAX_AGE_MS` | `350` | Drop stale opportunities before order submit |
+| `PRE_SUBMIT_PAIR_DRIFT_MAX` | `0.006` | Max allowed pair-cost drift before submit |
+| `PRE_SUBMIT_MIN_LIQ_FACTOR` | `0.95` | Min depth fraction required at submit time |
 | `WS_FILL_PRIMARY` | `true` | Use User WS stream as primary fill source |
 | `WS_FILL_FALLBACK_POLL_MS` | `300` | Poll fallback interval when WS fill stream is stale |
-| `SDK_POST_TIMEOUT_MS` | `1800` | Timeout for order submit calls |
-| `POST_BATCH_MAX_RETRIES` | `2` | Retries for transient batch submit failures |
+| `SDK_POST_TIMEOUT_MS` | `3000` | Timeout for order submit calls |
+| `POST_BATCH_MAX_RETRIES` | `1` | Retries for transient batch submit failures |
+| `GAMMA_REQUEST_RETRIES` | `2` | Gamma discovery retry count per query |
+| `GAMMA_RETRY_BASE_MS` | `300` | Base backoff between Gamma retries |
+| `DISCOVERY_DEGRADED_SECS` | `60` | Continuous discovery failure threshold before degraded warning |
 | `SDK_RETRY_BASE_DELAY_MS` | `60` | Retry backoff base delay |
 | `SDK_RETRY_MAX_DELAY_MS` | `600` | Retry backoff cap |
 | `DISABLE_SYSTEM_PROXY` | `true` | Ignore `HTTP(S)_PROXY` for lower-latency direct path |

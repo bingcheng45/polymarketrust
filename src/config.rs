@@ -25,6 +25,11 @@ pub struct Config {
     pub gtc_taker_timeout_ms: u64,
     pub ws_fill_primary: bool,
     pub ws_fill_fallback_poll_ms: u64,
+    pub strict_neutral_mode: bool,
+    pub neutrality_resume_net_shares: f64,
+    pub timeout_recovery_lock_secs: u64,
+    pub timeout_recovery_poll_ms: u64,
+    pub discovery_degraded_secs: u64,
     pub adaptive_throttle_min_ms: u64,
     pub adaptive_throttle_burst_debounce_ms: u64,
     pub actionable_delta_min_ticks: u32,
@@ -133,6 +138,23 @@ impl Config {
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .unwrap_or(300),
+            strict_neutral_mode: env::var("STRICT_NEUTRAL_MODE")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            neutrality_resume_net_shares: env_f64("NEUTRALITY_RESUME_NET_SHARES", 0.25)?,
+            timeout_recovery_lock_secs: env::var("TIMEOUT_RECOVERY_LOCK_SECS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .unwrap_or(10),
+            timeout_recovery_poll_ms: env::var("TIMEOUT_RECOVERY_POLL_MS")
+                .unwrap_or_else(|_| "200".to_string())
+                .parse()
+                .unwrap_or(200),
+            discovery_degraded_secs: env::var("DISCOVERY_DEGRADED_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
             adaptive_throttle_min_ms: env::var("ADAPTIVE_THROTTLE_MIN_MS")
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()

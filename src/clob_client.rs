@@ -14,6 +14,7 @@ use crate::types::{
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
+use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -512,9 +513,21 @@ impl ClobClient {
         let end_date_min = now.to_rfc3339_opts(SecondsFormat::Secs, true);
         let min_end_date = now + ChronoDuration::seconds(MARKET_EXPIRY_BUFFER_SECS);
 
-        let build_url = |with_end_date_min: bool, with_tag_id: Option<u64>| {
+        let build_events_url = |with_end_date_min: bool, with_tag_id: Option<u64>| {
             let mut url = format!(
                 "{GAMMA_BASE}/events?limit=100&active=true&closed=false&order=endDate&ascending=true"
+            );
+            if with_end_date_min {
+                url.push_str(&format!("&end_date_min={end_date_min}"));
+            }
+            if let Some(tid) = with_tag_id {
+                url.push_str(&format!("&tag_id={tid}"));
+            }
+            url
+        };
+        let build_markets_url = |with_end_date_min: bool, with_tag_id: Option<u64>| {
+            let mut url = format!(
+                "{GAMMA_BASE}/markets?limit=300&active=true&closed=false&order=endDate&ascending=true"
             );
             if with_end_date_min {
                 url.push_str(&format!("&end_date_min={end_date_min}"));
@@ -533,13 +546,13 @@ impl ClobClient {
             ("no_tag", false, None),
         ];
 
-        let mut seen_urls = HashSet::new();
+        let mut seen_event_urls = HashSet::new();
         let mut had_successful_gamma_response = false;
         let mut last_gamma_error: Option<anyhow::Error> = None;
 
         for (label, with_end_date_min, with_tag_id) in query_plan {
-            let url = build_url(with_end_date_min, with_tag_id);
-            if !seen_urls.insert(url.clone()) {
+            let url = build_events_url(with_end_date_min, with_tag_id);
+            if !seen_event_urls.insert(url.clone()) {
                 continue;
             }
 
@@ -563,32 +576,51 @@ impl ClobClient {
 
             let sorted = select_market_candidates(events, &slug_prefix, min_end_date);
             for (m, end_date) in sorted {
-                let clob_token_ids_str = match &m.clob_token_ids {
-                    Some(s) => s,
-                    None => continue,
-                };
-
-                let (yes, no) = match extract_binary_token_pair(clob_token_ids_str, m.outcomes.as_deref()) {
-                    Some((y, n)) => (y, n),
-                    _ => continue,
-                };
-
-                return Ok(Some(MarketInfo {
-                    condition_id: m.condition_id,
-                    question: m.question,
-                    end_date,
-                    neg_risk: m.neg_risk,
-                    tick_size: m.tick_size.unwrap_or(0.01),
-                    tokens: TokenIds {
-                        yes,
-                        no,
-                    },
-                }));
+                if let Some(info) = market_info_from_gamma_market(m, end_date) {
+                    return Ok(Some(info));
+                }
             }
         }
 
-        if !had_successful_gamma_response {
-            if let Some(err) = last_gamma_error {
+        // Secondary source: Gamma /markets. This endpoint tends to stay healthy
+        // even when /events intermittently fails.
+        let mut seen_market_urls = HashSet::new();
+        let mut had_successful_market_response = false;
+        let mut last_market_error: Option<anyhow::Error> = None;
+        for (label, with_end_date_min, with_tag_id) in query_plan {
+            let url = build_markets_url(with_end_date_min, with_tag_id);
+            if !seen_market_urls.insert(url.clone()) {
+                continue;
+            }
+
+            let markets = match self.fetch_gamma_markets(&url).await {
+                Ok(markets) => {
+                    had_successful_market_response = true;
+                    markets
+                }
+                Err(e) => {
+                    warn!(
+                        "Gamma markets discovery query '{label}' failed for slug '{slug_prefix}': {e}"
+                    );
+                    last_market_error = Some(e);
+                    continue;
+                }
+            };
+
+            if markets.is_empty() {
+                continue;
+            }
+
+            let sorted = select_market_candidates_from_markets(markets, &slug_prefix, min_end_date);
+            for (m, end_date) in sorted {
+                if let Some(info) = market_info_from_gamma_market(m, end_date) {
+                    return Ok(Some(info));
+                }
+            }
+        }
+
+        if !had_successful_gamma_response && !had_successful_market_response {
+            if let Some(err) = last_market_error.or(last_gamma_error) {
                 return Err(err).context(format!(
                     "all Gamma discovery queries failed for slug '{slug_prefix}'"
                 ));
@@ -599,8 +631,66 @@ impl ClobClient {
     }
 
     async fn fetch_gamma_events(&self, url: &str) -> Result<Vec<GammaEvent>> {
-        let resp = self
-            .http
+        self.fetch_gamma_payload(url, "events").await
+    }
+
+    async fn fetch_gamma_markets(&self, url: &str) -> Result<Vec<GammaMarket>> {
+        self.fetch_gamma_payload(url, "markets").await
+    }
+
+    async fn fetch_gamma_payload<T>(&self, url: &str, payload_name: &str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let retries = env_u64("GAMMA_REQUEST_RETRIES", 2);
+        let base_backoff_ms = env_u64("GAMMA_RETRY_BASE_MS", 300).max(50);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..=retries {
+            match Self::fetch_gamma_payload_with_client(&self.http, url, payload_name).await {
+                Ok(payload) => return Ok(payload),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < retries {
+                        let delay_ms = base_backoff_ms.saturating_mul(1u64 << attempt.min(6));
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        // Fallback path: use a fresh client with system proxy settings enabled.
+        // This helps recovery when the long-lived low-latency client is in a bad
+        // network state or no-proxy routing is temporarily broken.
+        let fallback_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(3))
+            .pool_idle_timeout(Duration::from_secs(5))
+            .build()
+            .context("failed to build fallback Gamma HTTP client")?;
+
+        match Self::fetch_gamma_payload_with_client(&fallback_http, url, payload_name).await {
+            Ok(payload) => Ok(payload),
+            Err(fallback_err) => {
+                let primary = last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown primary Gamma error".to_string());
+                Err(fallback_err).with_context(|| {
+                    format!("Gamma primary retries exhausted: {primary}")
+                })
+            }
+        }
+    }
+
+    async fn fetch_gamma_payload_with_client<T>(
+        client: &reqwest::Client,
+        url: &str,
+        payload_name: &str,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let resp = client
             .get(url)
             .send()
             .await
@@ -614,15 +704,16 @@ impl ClobClient {
         if !status.is_success() {
             let snippet: String = body.chars().take(240).collect();
             return Err(anyhow!(
-                "Gamma events API HTTP {} for {} | body: {}",
+                "Gamma {} API HTTP {} for {} | body: {}",
+                payload_name,
                 status,
                 url,
                 snippet
             ));
         }
 
-        serde_json::from_str::<Vec<GammaEvent>>(&body)
-            .with_context(|| format!("Failed to parse Gamma events payload from {url}"))
+        serde_json::from_str::<T>(&body)
+            .with_context(|| format!("Failed to parse Gamma {payload_name} payload from {url}"))
     }
 
     // ─── Price Feeds ──────────────────────────────────────────────────────────
@@ -1074,8 +1165,55 @@ fn select_market_candidates(
     candidates
 }
 
+fn select_market_candidates_from_markets(
+    markets: Vec<GammaMarket>,
+    slug_prefix: &str,
+    min_end_date: DateTime<Utc>,
+) -> Vec<(GammaMarket, DateTime<Utc>)> {
+    let mut candidates = Vec::new();
+    for market in markets {
+        let market_slug_matches = market
+            .slug
+            .as_deref()
+            .map(|slug| slug.to_ascii_lowercase().starts_with(slug_prefix))
+            .unwrap_or(false);
+        if !market_slug_matches {
+            continue;
+        }
+        if market.closed.unwrap_or(false) {
+            continue;
+        }
+
+        let end_date = match parse_market_end_date(market.end_date.as_deref()) {
+            Some(dt) => dt,
+            None => continue,
+        };
+        if end_date <= min_end_date {
+            continue;
+        }
+
+        candidates.push((market, end_date));
+    }
+
+    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    candidates
+}
+
 fn parse_market_end_date(raw: Option<&str>) -> Option<DateTime<Utc>> {
     raw.and_then(|s| s.parse::<DateTime<Utc>>().ok())
+}
+
+fn market_info_from_gamma_market(market: GammaMarket, end_date: DateTime<Utc>) -> Option<MarketInfo> {
+    let clob_token_ids_str = market.clob_token_ids.as_deref()?;
+    let (yes, no) = extract_binary_token_pair(clob_token_ids_str, market.outcomes.as_deref())?;
+    Some(MarketInfo {
+        condition_id: market.condition_id,
+        question: market.question,
+        end_date,
+        neg_risk: market.neg_risk,
+        tick_size: market.tick_size.unwrap_or(0.01),
+        tokens: TokenIds { yes, no },
+    })
 }
 
 fn extract_binary_token_pair(
@@ -1258,5 +1396,45 @@ mod tests {
         let selected = select_market_candidates(events, "btc-updown-5m", now);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].0.slug.as_deref(), Some("btc-updown-5m-1"));
+    }
+
+    #[test]
+    fn select_market_candidates_from_markets_prefers_nearest_future_match() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 40, 0)
+            .single()
+            .expect("valid datetime");
+
+        let markets = vec![
+            gamma_market(
+                "btc-updown-5m-early",
+                "2026-03-02T10:39:59Z",
+                r#"["Up","Down"]"#,
+                r#"["a","b"]"#,
+            ),
+            gamma_market(
+                "eth-updown-5m-x",
+                "2026-03-02T10:45:00Z",
+                r#"["Up","Down"]"#,
+                r#"["c","d"]"#,
+            ),
+            gamma_market(
+                "btc-updown-5m-1",
+                "2026-03-02T10:45:00Z",
+                r#"["Up","Down"]"#,
+                r#"["e","f"]"#,
+            ),
+            gamma_market(
+                "btc-updown-5m-2",
+                "2026-03-02T10:50:00Z",
+                r#"["Up","Down"]"#,
+                r#"["g","h"]"#,
+            ),
+        ];
+
+        let selected = select_market_candidates_from_markets(markets, "btc-updown-5m", now);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0.slug.as_deref(), Some("btc-updown-5m-1"));
+        assert_eq!(selected[1].0.slug.as_deref(), Some("btc-updown-5m-2"));
     }
 }

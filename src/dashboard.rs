@@ -40,6 +40,18 @@ pub struct DashboardState<'a> {
     pub session_start_balance: f64,
     pub session_successes: u64,
     pub session_failures: u64,
+    pub daily_pnl: f64,
+    pub execution_pnl: f64,
+    pub hedge_sellback_pnl: f64,
+    pub redemption_pnl: f64,
+    pub fees_gas_estimate: f64,
+    pub execution_success_count: u64,
+    pub economic_success_count: u64,
+    pub carry_naked_yes: f64,
+    pub carry_naked_no: f64,
+    pub carry_worst_case_loss: f64,
+    pub entry_lock_reason: Option<&'a str>,
+    pub entry_lock_remaining_secs: Option<u64>,
 
     // Circuit breaker
     pub circuit_breaker_active: bool,
@@ -227,14 +239,9 @@ impl Dashboard {
             ));
         }
 
-        // Daily PnL — always shown
+        // Daily PnL and reliability snapshot
         {
-            let bal = state.balance_usdc.unwrap_or(0.0);
-            let pnl = if state.session_start_balance > 0.0 {
-                bal - state.session_start_balance
-            } else {
-                0.0
-            };
+            let pnl = state.daily_pnl;
             let pnl_pct = if state.session_start_balance > 0.0 {
                 pnl / state.session_start_balance * 100.0
             } else {
@@ -250,6 +257,31 @@ impl Dashboard {
                 "   Daily PnL: {color}{sign}${pnl:.3} ({sign}{pnl_pct:.1}%){reset} | successes: {} | failures: {}\n",
                 state.session_successes, state.session_failures
             ));
+            out.push_str(&format!(
+                "   PnL parts: exec ${:+.3} | hedge/sell-back ${:+.3} | redemption ${:+.3} | fees+gas ${:+.3}\n",
+                state.execution_pnl,
+                state.hedge_sellback_pnl,
+                state.redemption_pnl,
+                state.fees_gas_estimate
+            ));
+            out.push_str(&format!(
+                "   Success split: execution {} | economic {}\n",
+                state.execution_success_count, state.economic_success_count
+            ));
+            out.push_str(&format!(
+                "   Carry Risk: naked Up {:.3} | naked Down {:.3} | worst-case directional loss ${:.2}\n",
+                state.carry_naked_yes, state.carry_naked_no, state.carry_worst_case_loss
+            ));
+            if let Some(reason) = state.entry_lock_reason {
+                if let Some(remaining) = state.entry_lock_remaining_secs {
+                    out.push_str(&format!(
+                        "   Entry Lock: {} ({}s remaining)\n",
+                        reason, remaining
+                    ));
+                } else {
+                    out.push_str(&format!("   Entry Lock: {}\n", reason));
+                }
+            }
         }
 
         out.push_str(&"-".repeat(SEPARATOR_WIDTH));
