@@ -1,6 +1,53 @@
 use anyhow::{Context, Result};
 use std::env;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyMode {
+    Taker,
+    Maker,
+    PostOnly,
+}
+
+impl StrategyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Taker => "taker",
+            Self::Maker => "maker",
+            Self::PostOnly => "post-only",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "taker" => Some(Self::Taker),
+            "maker" => Some(Self::Maker),
+            "post-only" | "postonly" | "post-only-maker" => Some(Self::PostOnly),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Result<Self> {
+        if let Ok(raw) = env::var("STRATEGY_MODE") {
+            return Self::parse(&raw).with_context(|| {
+                format!(
+                    "Invalid STRATEGY_MODE '{raw}'. Expected one of: taker, maker, post-only"
+                )
+            });
+        }
+
+        let legacy_maker = env::var("MAKER_MODE_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap_or(false);
+        Ok(if legacy_maker {
+            Self::Maker
+        } else {
+            Self::Taker
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub private_key: String,
@@ -20,6 +67,7 @@ pub struct Config {
     pub circuit_breaker_cooldown_ms: u64,
     pub ws_enabled: bool,
     pub pre_sign_enabled: bool,
+    pub strategy_mode: StrategyMode,
     pub maker_mode_enabled: bool,
     pub maker_spread_ticks: u32,
     pub gtc_taker_timeout_ms: u64,
@@ -84,6 +132,7 @@ impl Config {
         if market_slugs.is_empty() {
             anyhow::bail!("MARKET_SLUG must not be empty");
         }
+        let strategy_mode = StrategyMode::from_env()?;
 
         Ok(Self {
             private_key,
@@ -118,10 +167,8 @@ impl Config {
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .unwrap_or(true),
-            maker_mode_enabled: env::var("MAKER_MODE_ENABLED")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
+            strategy_mode,
+            maker_mode_enabled: matches!(strategy_mode, StrategyMode::Maker | StrategyMode::PostOnly),
             maker_spread_ticks: env::var("MAKER_SPREAD_TICKS")
                 .unwrap_or_else(|_| "2".to_string())
                 .parse()
@@ -187,6 +234,14 @@ impl Config {
     /// Whether this config uses a proxy wallet.
     pub fn uses_proxy(&self) -> bool {
         self.signature_type >= 1
+    }
+
+    pub fn uses_resting_orders(&self) -> bool {
+        matches!(self.strategy_mode, StrategyMode::Maker | StrategyMode::PostOnly)
+    }
+
+    pub fn is_post_only_mode(&self) -> bool {
+        matches!(self.strategy_mode, StrategyMode::PostOnly)
     }
 }
 

@@ -4,7 +4,7 @@
 //!   - Validate config & build client
 //!   - Initialize market monitor (balance, positions, WS)
 //!   - Run check_opportunity every ~1 second
-//!   - Run maker_fills check every 2 seconds
+//!   - Run resting-order fill check every 2 seconds
 //!   - Run WS health check every 30 seconds
 //!   - Flush stats and shutdown gracefully on SIGINT/SIGTERM
 
@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
     println!("Market slugs : {}", config.market_slugs.join(", "));
     println!("Max trade    : {} shares", config.max_trade_size);
     println!("Min profit   : ${}", config.min_net_profit_usd);
+    println!("Strategy     : {}", config.strategy_mode.as_str());
     println!("Mock mode    : {}", config.mock_currency);
     println!("Sig type     : {}", config.signature_type);
 
@@ -163,7 +164,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 2. Maker fill check every 2 seconds
+    // 2. Resting strategy fill check every 2 seconds
     let maker_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(2_000));
         loop {

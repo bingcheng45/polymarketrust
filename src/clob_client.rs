@@ -215,6 +215,30 @@ impl ClobClient {
         _neg_risk: bool,
         _fee_rate_bps: u64,
     ) -> Result<SignedOrder> {
+        self.sign_order_with_post_only(
+            token_id,
+            price,
+            size,
+            side,
+            time_in_force,
+            _neg_risk,
+            _fee_rate_bps,
+            false,
+        )
+        .await
+    }
+
+    pub async fn sign_order_with_post_only(
+        &self,
+        token_id: &str,
+        price: f64,
+        size: f64,
+        side: Side,
+        time_in_force: TimeInForce,
+        _neg_risk: bool,
+        _fee_rate_bps: u64,
+        post_only: bool,
+    ) -> Result<SignedOrder> {
         let size = (size * 100.0).floor() / 100.0;
         let size_decimal = Decimal::from_str(&size.to_string())?;
         let price_decimal = Decimal::from_str(&price.to_string())?;
@@ -230,13 +254,15 @@ impl ClobClient {
             TimeInForce::Gtd => SdkOrderType::GTD,
         };
 
-        let limit_order = self.sdk_client
+        let limit_order = self
+            .sdk_client
             .limit_order()
             .token_id(U256::from_str(token_id)?)
             .price(price_decimal)
             .size(size_decimal)
             .side(sdk_side)
             .order_type(sdk_order_type)
+            .post_only(post_only)
             .build()
             .await?;
 

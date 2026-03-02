@@ -1,9 +1,7 @@
-//! GTC limit order maker strategy (replicates maker_strategy.ts).
+//! GTC post-only quoting strategy.
 //!
-//! Instead of taking liquidity with FOK orders, this mode posts GTC
-//! bids at `ask - (SPREAD_TICKS × tick_size)` for both YES and NO legs.
-//! It handles partial and full fills, hedges imbalances, and only updates
-//! orders when prices move more than one tick from the last posted price.
+//! Similar to maker mode, but signs orders with `postOnly=true` so any
+//! crossing order is rejected by the exchange instead of paying taker fees.
 
 use crate::clob_client::ClobClient;
 use crate::config::Config;
@@ -13,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 
-pub struct MakerStrategy {
+pub struct PostOnlyStrategy {
     config: Arc<Config>,
     yes_order_id: Option<String>,
     no_order_id: Option<String>,
@@ -25,7 +23,7 @@ pub struct MakerStrategy {
     last_update: Option<Instant>,
 }
 
-impl MakerStrategy {
+impl PostOnlyStrategy {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             config,
@@ -40,42 +38,41 @@ impl MakerStrategy {
         }
     }
 
-    /// Post or update GTC bids below current best asks.
-    ///
-    /// Returns true if orders were (re)posted.
+    /// Post or refresh post-only bids for YES/NO.
     pub async fn update_orders(
         &mut self,
         client: &ClobClient,
         market: &MarketInfo,
         yes_ask: f64,
         no_ask: f64,
+        yes_bid: f64,
+        no_bid: f64,
         fee_rate_bps: u64,
     ) -> Result<bool> {
         let spread_ticks = self.config.maker_spread_ticks as f64 * market.tick_size;
-        let yes_bid = (yes_ask - spread_ticks).max(0.01);
-        let no_bid = (no_ask - spread_ticks).max(0.01);
+        let price_floor = market.tick_size.max(0.01);
+        let yes_bid_px = (yes_ask - spread_ticks).min(yes_bid).max(price_floor);
+        let no_bid_px = (no_ask - spread_ticks).min(no_bid).max(price_floor);
 
-        // Ensure combined bid is below $1 (otherwise no arb edge)
-        if yes_bid + no_bid >= 1.0 {
+        // Avoid locked pairs with no structural edge.
+        if yes_bid_px + no_bid_px >= 1.0 {
             return Ok(false);
         }
 
-        // Only update if prices moved more than 1 tick since last post
-        let tick = market.tick_size;
+        // Only update when quote moved by at least one tick.
+        let tick = market.tick_size.max(0.001);
         let yes_moved = self
             .last_yes_price
-            .map(|p| (yes_bid - p).abs() > tick)
+            .map(|p| (yes_bid_px - p).abs() >= tick)
             .unwrap_or(true);
         let no_moved = self
             .last_no_price
-            .map(|p| (no_bid - p).abs() > tick)
+            .map(|p| (no_bid_px - p).abs() >= tick)
             .unwrap_or(true);
-
         if !yes_moved && !no_moved {
             return Ok(false);
         }
 
-        // Cancel stale orders first
         if let Some(id) = self.yes_order_id.take() {
             let _ = client.cancel_order(&id).await;
         }
@@ -86,38 +83,33 @@ impl MakerStrategy {
         self.no_net_filled = 0.0;
 
         self.fee_enabled = fee_rate_bps > 0;
-        let size = self.quote_order_size(yes_bid, no_bid);
-
-        // Sign both bids
+        let size = self.quote_order_size(yes_bid_px, no_bid_px);
         let yes_order = client
-            .sign_order(
+            .sign_order_with_post_only(
                 &market.tokens.yes,
-                yes_bid,
+                yes_bid_px,
                 size,
                 Side::Buy,
                 TimeInForce::Gtc,
                 market.neg_risk,
                 fee_rate_bps,
+                true,
             )
             .await?;
-
         let no_order = client
-            .sign_order(
+            .sign_order_with_post_only(
                 &market.tokens.no,
-                no_bid,
+                no_bid_px,
                 size,
                 Side::Buy,
                 TimeInForce::Gtc,
                 market.neg_risk,
                 fee_rate_bps,
+                true,
             )
             .await?;
 
-        // Post both
-        let results = client
-            .post_orders(vec![yes_order, no_order], "GTC")
-            .await?;
-
+        let results = client.post_orders(vec![yes_order, no_order], "GTC").await?;
         if results.len() >= 2 {
             let yes_order_id = results[0].order_id.trim().to_string();
             let no_order_id = results[1].order_id.trim().to_string();
@@ -127,23 +119,20 @@ impl MakerStrategy {
 
             self.yes_order_id = Some(yes_order_id);
             self.no_order_id = Some(no_order_id);
-            self.last_yes_price = Some(yes_bid);
-            self.last_no_price = Some(no_bid);
+            self.last_yes_price = Some(yes_bid_px);
+            self.last_no_price = Some(no_bid_px);
             self.yes_net_filled = 0.0;
             self.no_net_filled = 0.0;
             self.last_update = Some(Instant::now());
-
             info!(
-                "Maker: posted YES bid @ {yes_bid:.3} / NO bid @ {no_bid:.3} (size {size})"
+                "Post-only: quoted YES @ {yes_bid_px:.3} / NO @ {no_bid_px:.3} (size {size})"
             );
         }
 
         Ok(true)
     }
 
-    /// Poll for fills and return any imbalance that needs hedging.
-    ///
-    /// Returns `(yes_filled, no_filled)` sizes.
+    /// Returns `(yes_filled, no_filled)`.
     pub async fn check_fills(
         &mut self,
         client: &ClobClient,
@@ -179,7 +168,6 @@ impl MakerStrategy {
         Ok((yes_delta, no_delta))
     }
 
-    /// Cancel all open maker orders.
     pub async fn cancel_all(&mut self, client: &ClobClient) -> Result<()> {
         if let Some(id) = self.yes_order_id.take() {
             let _ = client.cancel_order(&id).await;

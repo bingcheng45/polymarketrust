@@ -3,7 +3,7 @@
 //! Manages the full lifecycle of a Polymarket arbitrage bot:
 //!   - Market discovery & rollover
 //!   - Orderbook fetching (WS primary, REST fallback)
-//!   - Arbitrage detection & execution (immediate taker / GTC maker)
+//!   - Arbitrage detection & execution (taker / maker / post-only)
 //!   - Position tracking (YES/NO sizes, costs)
 //!   - Hedge / sell-back logic on partial fills
 //!   - Merge & redemption automation
@@ -11,10 +11,11 @@
 //!   - Gas cache refresh
 
 use crate::clob_client::ClobClient;
-use crate::config::Config;
+use crate::config::{Config, StrategyMode};
 use crate::dashboard::{Dashboard, DashboardState};
 use crate::logger::SessionLogger;
 use crate::maker_strategy::MakerStrategy;
+use crate::post_only_strategy::PostOnlyStrategy;
 use crate::market_stats::MarketStatsTracker;
 use crate::trade_logger::TradeLogger;
 use crate::types::{
@@ -131,6 +132,7 @@ pub struct MarketMonitor {
     trade_logger: TradeLogger,
     stats: MarketStatsTracker,
     maker: Option<MakerStrategy>,
+    post_only: Option<PostOnlyStrategy>,
 
     // Active market
     market_info: Option<MarketInfo>,
@@ -261,10 +263,10 @@ impl MarketMonitor {
         let stats = MarketStatsTracker::load().await?;
         let session_successes_baseline = stats.successes();
         let session_failures_baseline = stats.failures();
-        let maker = if config.maker_mode_enabled {
-            Some(MakerStrategy::new(Arc::clone(&config)))
-        } else {
-            None
+        let (maker, post_only) = match config.strategy_mode {
+            StrategyMode::Maker => (Some(MakerStrategy::new(Arc::clone(&config))), None),
+            StrategyMode::PostOnly => (None, Some(PostOnlyStrategy::new(Arc::clone(&config)))),
+            StrategyMode::Taker => (None, None),
         };
         let (merge_result_tx, merge_result_rx) = mpsc::unbounded_channel();
         let adaptive_min_profit_usd = config.min_net_profit_usd;
@@ -279,6 +281,7 @@ impl MarketMonitor {
             trade_logger,
             stats,
             maker,
+            post_only,
             market_info: None,
             cached_fee_rate_bps: 0,
             position: Position::default(),
@@ -897,19 +900,59 @@ impl MarketMonitor {
             return;
         }
 
-        // Maker mode: post limit orders instead of taking
-        if self.config.maker_mode_enabled {
-            self.log_action_fast(
-                "🧾 ORDER SEND (taker): NO — maker mode is enabled, posting/refreshing resting bids instead.",
-            );
-            if let Some(ref mut maker) = self.maker {
-                // Approximate max fee for maker tracking purposes
-                let active_fee_rate = if self.cached_fee_rate_bps > 0 { self.config.clob_fee_rate } else { 0.0 };
-                let fee_bps = (active_fee_rate * 10_000.0).round() as u64;
-                let _ = maker.update_orders(&self.client, &mi, yes_ask, no_ask, fee_bps).await;
+        // Resting-quote strategies: post/update bids instead of taker crossing.
+        match self.config.strategy_mode {
+            StrategyMode::Maker => {
+                self.log_action_fast(
+                    "🧾 ORDER SEND (taker): NO — maker strategy is enabled, posting/refreshing resting bids.",
+                );
+                if let Some(ref mut maker) = self.maker {
+                    let active_fee_rate = if self.cached_fee_rate_bps > 0 {
+                        self.config.clob_fee_rate
+                    } else {
+                        0.0
+                    };
+                    let fee_bps = (active_fee_rate * 10_000.0).round() as u64;
+                    let _ = maker
+                        .update_orders(&self.client, &mi, yes_ask, no_ask, fee_bps)
+                        .await;
+                }
+                self.request_render();
+                return;
             }
-            self.request_render();
-            return;
+            StrategyMode::PostOnly => {
+                self.log_action_fast(
+                    "🧾 ORDER SEND (taker): NO — post-only strategy is enabled, posting postOnly resting bids.",
+                );
+                if let Some(ref mut strategy) = self.post_only {
+                    let active_fee_rate = if self.cached_fee_rate_bps > 0 {
+                        self.config.clob_fee_rate
+                    } else {
+                        0.0
+                    };
+                    let fee_bps = (active_fee_rate * 10_000.0).round() as u64;
+                    let yes_bid = yes_book
+                        .best_bid()
+                        .unwrap_or((yes_ask - mi.tick_size).max(0.01));
+                    let no_bid = no_book
+                        .best_bid()
+                        .unwrap_or((no_ask - mi.tick_size).max(0.01));
+                    let _ = strategy
+                        .update_orders(
+                            &self.client,
+                            &mi,
+                            yes_ask,
+                            no_ask,
+                            yes_bid,
+                            no_bid,
+                            fee_bps,
+                        )
+                        .await;
+                }
+                self.request_render();
+                return;
+            }
+            StrategyMode::Taker => {}
         }
 
         // Calculate trade size
@@ -3355,9 +3398,12 @@ impl MarketMonitor {
         // Flush stats
         self.stats.flush().await;
 
-        // Cancel maker orders
+        // Cancel resting strategy orders
         if let Some(ref mut maker) = self.maker {
             let _ = maker.cancel_all(&self.client).await;
+        }
+        if let Some(ref mut strategy) = self.post_only {
+            let _ = strategy.cancel_all(&self.client).await;
         }
 
         // Clear active market + WS while we search for the next market.
@@ -3439,10 +3485,10 @@ impl MarketMonitor {
         );
     }
 
-    // ─── Maker Fill Check ─────────────────────────────────────────────────────
+    // ─── Resting Strategy Fill Check ──────────────────────────────────────────
 
     pub async fn check_maker_fills(&mut self) {
-        if !self.config.maker_mode_enabled {
+        if !self.config.uses_resting_orders() {
             return;
         }
         let mi = match self.market_info.clone() {
@@ -3450,27 +3496,48 @@ impl MarketMonitor {
             None => return,
         };
 
-        if let Some(ref mut maker) = self.maker {
-            if let Ok((yes_filled, no_filled)) =
-                maker.check_fills(&self.client, &mi.condition_id).await
-            {
-                if yes_filled > 0.01 || no_filled > 0.01 {
-                    self.position.yes_size += yes_filled;
-                    self.position.no_size += no_filled;
-                    self.note_position_activity();
-                    self.active_assets.insert(mi.tokens.yes.clone());
-                    self.active_assets.insert(mi.tokens.no.clone());
+        let fills = match self.config.strategy_mode {
+            StrategyMode::Maker => {
+                if let Some(ref mut maker) = self.maker {
+                    maker.check_fills(&self.client, &mi.condition_id).await.ok()
+                } else {
+                    None
+                }
+            }
+            StrategyMode::PostOnly => {
+                if let Some(ref mut strategy) = self.post_only {
+                    strategy.check_fills(&self.client, &mi.condition_id).await.ok()
+                } else {
+                    None
+                }
+            }
+            StrategyMode::Taker => None,
+        };
 
-                    info!("Maker fills: YES={yes_filled:.2} NO={no_filled:.2}");
-                    self.log_action(&format!(
-                        "✅ Maker fill: UP {yes_filled:.2} | DOWN {no_filled:.2}"
-                    ))
-                    .await;
+        if let Some((yes_filled, no_filled)) = fills {
+            if yes_filled > 0.01 || no_filled > 0.01 {
+                self.position.yes_size += yes_filled;
+                self.position.no_size += no_filled;
+                self.note_position_activity();
+                self.active_assets.insert(mi.tokens.yes.clone());
+                self.active_assets.insert(mi.tokens.no.clone());
 
-                    let fire_amount = self.mergeable_available();
-                    if fire_amount >= 1.0 {
-                        self.fire_merge(fire_amount, &mi).await;
-                    }
+                let strategy_label = if self.config.is_post_only_mode() {
+                    "Post-only"
+                } else {
+                    "Maker"
+                };
+                info!(
+                    "{strategy_label} fills: YES={yes_filled:.2} NO={no_filled:.2}"
+                );
+                self.log_action(&format!(
+                    "✅ {strategy_label} fill: UP {yes_filled:.2} | DOWN {no_filled:.2}"
+                ))
+                .await;
+
+                let fire_amount = self.mergeable_available();
+                if fire_amount >= 1.0 {
+                    self.fire_merge(fire_amount, &mi).await;
                 }
             }
         }
@@ -5061,9 +5128,12 @@ impl MarketMonitor {
         // Flush stats
         self.stats.flush().await;
 
-        // Cancel maker orders
+        // Cancel resting strategy orders
         if let Some(ref mut maker) = self.maker {
             let _ = maker.cancel_all(&self.client).await;
+        }
+        if let Some(ref mut strategy) = self.post_only {
+            let _ = strategy.cancel_all(&self.client).await;
         }
 
         // Close session logger
@@ -5101,6 +5171,7 @@ mod tests {
         cfg.circuit_breaker_cooldown_ms = 300_000;
         cfg.ws_enabled = false;
         cfg.pre_sign_enabled = false;
+        cfg.strategy_mode = StrategyMode::Taker;
         cfg.maker_mode_enabled = false;
         cfg.maker_spread_ticks = 2;
         cfg.gtc_taker_timeout_ms = 5_000;
@@ -5136,6 +5207,7 @@ mod tests {
             trade_logger: TradeLogger::new().await.ok()?,
             stats: MarketStatsTracker::load().await.ok()?,
             maker: None,
+            post_only: None,
             market_info: None,
             position: Position::default(),
             session_locked_value: 0.0,

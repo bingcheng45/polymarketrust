@@ -11,7 +11,7 @@ A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScr
 - **Strict-neutral entry lock** — new entries are blocked until inventory ambiguity/imbalance is resolved
 - **Hard timeout recovery lock** — ambiguous submit timeouts trigger deterministic recovery before resuming
 - **WebSocket orderbook feed** — real-time updates from Polymarket's WS API with REST fallback
-- **Maker mode** — optional GTC limit orders posted below best ask instead of FOK taker orders
+- **Strategy selector** — choose `post-only` (new market-maker mode), `taker`, or legacy `maker`
 - **Dynamic fee calculation** — `fee = CLOB_FEE_RATE × (price × (1 − price))^CLOB_FEE_EXPONENT`
 - **Background maintenance workers** — balance (2s), claim polling (5s), and gas cache refresh (30s) off the WS hot path
 - **Merge reconciliation worker** — periodic reserved-state reconciliation for merge confirmations/failures
@@ -67,7 +67,7 @@ Key parameters:
 |---|---|---|
 | `MARKET_SLUG` | `btc-updown-15m` | Market slug prefix (comma-separated for multi-market) |
 | `MAX_TRADE_SIZE` | `12` | Max shares per arb execution (stability-first) |
-| `MIN_PAIRED_SHARES` | `5` | Minimum paired size required after fee adjustment |
+| `MIN_PAIRED_SHARES` | `5` | Minimum net paired size after fee adjustment (post-only quotes auto-scale to satisfy this) |
 | `MIN_CHILD_ORDER_SIZE` | `5` | Minimum child slice size for taker batching |
 | `TARGET_CHILD_ORDER_SIZE` | `12` | Target child slice size for taker batching |
 | `MAX_TAKER_BATCHES` | `1` | Upper bound on child slices per opportunity |
@@ -82,7 +82,8 @@ Key parameters:
 | `MIN_LEG_PRICE` | `0.12` | Skip opportunities with near-resolved legs |
 | `MOCK_CURRENCY` | `false` | Paper trading mode (no real orders) |
 | `WS_ENABLED` | `true` | Enable WebSocket feed |
-| `MAKER_MODE_ENABLED` | `false` | Use GTC resting maker orders instead of immediate taker |
+| `STRATEGY_MODE` | `taker` | Execution path: `post-only` (new market-maker mode, recommended), `taker`, or legacy `maker` |
+| `MAKER_MODE_ENABLED` | `false` | Legacy fallback when `STRATEGY_MODE` is unset |
 | `TAKER_ORDER_TYPE` | `FAK` | Immediate taker type (`FAK` or `FOK`) |
 | `HEDGE_ORDER_TYPE` | `FAK` | Hedge/sell-back order type (`FAK` preferred for stability) |
 | `PRE_SUBMIT_SIGNAL_MAX_AGE_MS` | `350` | Drop stale opportunities before order submit |
@@ -116,6 +117,24 @@ Key parameters:
   - set `SHADOW_ENGINE_SEND_ORDERS=true` (you may keep `SHADOW_ENGINE_ENABLED=true`),
   - restart the bot.
 
+### Recommended Post-Only Settings
+
+Use these when running the new market-maker mode:
+
+```env
+STRATEGY_MODE=post-only
+MAKER_SPREAD_TICKS=2
+MIN_PAIRED_SHARES=5
+MIN_SELL_RESCUE_SHARES=5
+MIN_IMBALANCE_SELL_SHARES=5
+MIN_RESCUE_BUY_SHARES=1
+MIN_IMBALANCE_BUY_SHARES=1
+```
+
+Notes:
+- Resting quote size is fee-aware: gross quote size is automatically increased when needed so net paired shares can still satisfy `MIN_PAIRED_SHARES` after fees.
+- Resting-mode fills are tracked as **net-after-fee deltas** (not cumulative gross), which keeps imbalance/sellback thresholds aligned with what is actually sellable.
+
 ## Architecture
 
 ```
@@ -126,7 +145,8 @@ src/
 ├── clob_client.rs     # Polymarket CLOB REST API + EIP-712 signing
 ├── ws_client.rs       # WebSocket orderbook feed
 ├── market_monitor.rs  # Core orchestrator (arb detection & execution)
-├── maker_strategy.rs  # GTC limit order maker mode
+├── maker_strategy.rs  # Legacy resting-quote maker strategy
+├── post_only_strategy.rs # postOnly=true resting-quote strategy
 ├── market_stats.rs    # Persistent statistics
 ├── trade_logger.rs    # JSONL trade event log
 ├── logger.rs          # Session file logger
