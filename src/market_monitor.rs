@@ -3706,6 +3706,39 @@ impl MarketMonitor {
         self.ws_yes_age_ms = None;
         self.ws_no_age_ms = None;
         self.last_market_discovery_attempt = Some(Instant::now());
+
+        // Position state is market-specific (token ids change every 5m market).
+        // Reset stale in-memory inventory now so expired-market carry cannot be
+        // hedged using the next market's prices during discovery/rollover gaps.
+        let stale_yes = self.position.yes_size;
+        let stale_no = self.position.no_size;
+        if stale_yes > 0.01 || stale_no > 0.01 {
+            self.log_action(&format!(
+                "🧹 Rollover reset: clearing expired-market in-mem position UP {:.2} / DOWN {:.2}",
+                stale_yes, stale_no
+            ))
+            .await;
+        }
+        self.position = Position::default();
+        self.pending_merge_reserved_size = 0.0;
+        self.hedge_cooldown_until = None;
+        self.consecutive_hedge_failures = 0;
+        self.reconcile_drift_streak = 0;
+        self.timeout_recovery_active = false;
+        self.unresolved_ambiguous_batches.clear();
+        if matches!(
+            self.entry_lock_reason,
+            Some(
+                EntryLockReason::Imbalance
+                    | EntryLockReason::TimeoutRecovery
+                    | EntryLockReason::AmbiguousFill
+                    | EntryLockReason::ReconcileDrift
+            )
+        ) {
+            self.entry_lock_reason = None;
+            self.entry_lock_until = None;
+        }
+
         self.order_tracker.clear();
         self.order_to_batch.clear();
         self.execution_batches.clear();
@@ -3743,6 +3776,9 @@ impl MarketMonitor {
         if self.market_info.is_none() {
             return;
         }
+
+        // Seed position from current market trades only (safe after reset).
+        self.recover_positions_from_trades().await;
 
         // Resubscribe WS (Hard Reconnect)
         self.connect_ws_for_active_market(true).await;
