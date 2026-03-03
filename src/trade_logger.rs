@@ -183,7 +183,7 @@ impl TradeLogger {
         condition_id: &str,
         market: Option<&str>,
         size: f64,
-        profit_usd: f64,
+        _claimed_usd: f64,
         success: bool,
         error: Option<String>,
     ) {
@@ -197,7 +197,9 @@ impl TradeLogger {
             size: Some(size),
             cost_usd: None,
             gas_fee_usd: None,
-            profit_usd: Some(profit_usd),
+            // Redemption size is gross cash-in and not net PnL against entry basis.
+            // Leave `profitUsd` empty to avoid downstream over-counting.
+            profit_usd: None,
             success,
             error,
         })

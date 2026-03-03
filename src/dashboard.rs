@@ -264,7 +264,7 @@ impl Dashboard {
                 state.session_successes, state.session_failures
             ));
             out.push_str(&format!(
-                "   Engine estimates: exec ${:+.3} | hedge/sell-back ${:+.3} | redemption ${:+.3} | fees+gas ${:+.3}\n",
+                "   Engine estimates: exec ${:+.3} | hedge/sell-back ${:+.3} | redemption cash-in ${:+.3} | fees+gas ${:+.3}\n",
                 state.execution_pnl,
                 state.hedge_sellback_pnl,
                 state.redemption_pnl,

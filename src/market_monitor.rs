@@ -3586,6 +3586,7 @@ impl MarketMonitor {
                         cid.clone(),
                         Instant::now() + Duration::from_secs(CLAIM_SUCCESS_SUPPRESSION_SECS),
                     );
+                    // Gross claim cash-in; not net PnL against unknown entry basis.
                     m.redemption_pnl += amount;
                     m.sync_daily_pnl_from_components();
                     m.log_action(&format!(
