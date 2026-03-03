@@ -6,6 +6,7 @@ pub mod maker_strategy;
 pub mod market_monitor;
 pub mod market_stats;
 pub mod post_only_strategy;
+pub mod run_memory;
 pub mod trade_logger;
 pub mod types;
 pub mod ws_client;

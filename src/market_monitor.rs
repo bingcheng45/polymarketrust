@@ -16,6 +16,7 @@ use crate::dashboard::{Dashboard, DashboardState};
 use crate::logger::SessionLogger;
 use crate::maker_strategy::MakerStrategy;
 use crate::post_only_strategy::PostOnlyStrategy;
+use crate::run_memory::{append_run_memory_entry, RunMemoryEntry};
 use crate::market_stats::MarketStatsTracker;
 use crate::trade_logger::TradeLogger;
 use crate::types::{
@@ -5601,6 +5602,99 @@ impl MarketMonitor {
         }
         if let Some(ref mut strategy) = self.post_only {
             let _ = strategy.cancel_all(&self.client).await;
+        }
+
+        let end_balance = self.last_balance.unwrap_or(0.0);
+        let session_pnl_usd = end_balance - self.session_start_balance;
+        let session_pnl_pct = if self.session_start_balance > 0.0 {
+            (session_pnl_usd / self.session_start_balance) * 100.0
+        } else {
+            0.0
+        };
+        let adaptive_hedge_failure_ratio = self.adaptive_hedge_failure_ratio();
+        let mut risk_flags = Vec::new();
+        if self.position.has_imbalance() {
+            risk_flags.push("position_imbalance".to_string());
+        }
+        if let Some(ratio) = adaptive_hedge_failure_ratio {
+            if ratio >= 0.50 {
+                risk_flags.push(format!("high_hedge_fail_ratio:{ratio:.2}"));
+            }
+        }
+        if let Some(reason) = self.entry_lock_reason {
+            risk_flags.push(format!(
+                "entry_lock:{}",
+                Self::entry_lock_reason_label(reason)
+            ));
+        }
+        if self.discovery_failure_since.is_some() {
+            risk_flags.push("discovery_degraded".to_string());
+        }
+        let outcome = if session_pnl_usd > 0.01 {
+            "win"
+        } else if session_pnl_usd < -0.01 {
+            "loss"
+        } else {
+            "flat"
+        }
+        .to_string();
+
+        let config_keys = [
+            "STRATEGY_MODE",
+            "MAX_TRADE_SIZE",
+            "RESTING_MIN_EDGE_PER_SHARE",
+            "MAKER_SPREAD_TICKS",
+            "MIN_NET_PROFIT_USD",
+            "IMBALANCE_MAX_EXPECTED_LOSS_USD",
+            "IMBALANCE_LOSS_GUARD_RETRY_SECS",
+            "IMBALANCE_LOSS_GUARD_DISABLE_BELOW_SECS",
+            "IMBALANCE_RELAYER_GRACE_SECS",
+            "IMBALANCE_RELAYER_RETRY_SECS",
+        ];
+        let config_snapshot = config_keys
+            .iter()
+            .map(|key| {
+                (
+                    (*key).to_string(),
+                    std::env::var(key).unwrap_or_else(|_| "<unset>".to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let run_entry = RunMemoryEntry {
+            timestamp: Utc::now(),
+            market_slug: self.config.market_slugs.join(","),
+            strategy_mode: self.config.strategy_mode.as_str().to_string(),
+            session_start_balance: self.session_start_balance,
+            session_end_balance: end_balance,
+            session_pnl_usd,
+            session_pnl_pct,
+            execution_pnl: self.execution_pnl,
+            hedge_sellback_pnl: self.hedge_sellback_pnl,
+            redemption_cashin_usd: self.redemption_pnl,
+            fees_gas_estimate: self.fees_gas_estimate,
+            session_successes: self.session_successes(),
+            session_failures: self.session_failures(),
+            execution_success_count: self.execution_success_count,
+            economic_success_count: self.economic_success_count,
+            adaptive_pressure: self.adaptive_pressure,
+            adaptive_min_profit_usd: self.adaptive_min_profit_usd,
+            adaptive_max_trade_size: self.adaptive_max_trade_size,
+            adaptive_hedge_failure_ratio,
+            position_yes_size: self.position.yes_size,
+            position_no_size: self.position.no_size,
+            position_yes_cost: self.position.yes_cost,
+            position_no_cost: self.position.no_cost,
+            pending_claim_usdc: self.pending_claim_value,
+            entry_lock_reason: self
+                .entry_lock_reason
+                .map(|r| Self::entry_lock_reason_label(r).to_string()),
+            outcome,
+            risk_flags,
+            config_snapshot,
+        };
+        if let Err(e) = append_run_memory_entry(&run_entry).await {
+            warn!("Failed to append run memory entry: {e}");
         }
 
         // Close session logger
