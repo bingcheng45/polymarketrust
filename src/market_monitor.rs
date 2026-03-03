@@ -3042,6 +3042,30 @@ impl MarketMonitor {
             }
         }
 
+        // Hard loss guard: avoid forcing a hedge/sell-back when projected
+        // outcomes are too negative. Near expiry, bypass to reduce hard carry.
+        let max_expected_loss = Self::env_f64("IMBALANCE_MAX_EXPECTED_LOSS_USD", 1.25).max(0.0);
+        let guard_disable_below_secs =
+            Self::env_u64("IMBALANCE_LOSS_GUARD_DISABLE_BELOW_SECS", 45) as i64;
+        let secs_to_expiry = (mi.end_date - Utc::now()).num_seconds();
+        let best_projected_recovery_pnl = if can_sell_back {
+            sell_pnl.max(hedge_pnl)
+        } else {
+            hedge_pnl
+        };
+        if secs_to_expiry > guard_disable_below_secs
+            && best_projected_recovery_pnl < -max_expected_loss
+        {
+            let retry_secs = Self::env_u64("IMBALANCE_LOSS_GUARD_RETRY_SECS", 8).max(1);
+            self.hedge_cooldown_until = Some(Instant::now() + Duration::from_secs(retry_secs));
+            self.log_action(&format!(
+                "🛡️ Imbalance action paused: best projected recovery PnL ${:+.2} below loss guard -${:.2}; retry in {}s.",
+                best_projected_recovery_pnl, max_expected_loss, retry_secs
+            ))
+            .await;
+            return;
+        }
+
         let sell_back = can_sell_back && sell_pnl >= hedge_pnl;
 
         if !can_sell_back && !sell_back_blocked_by_relayer {
