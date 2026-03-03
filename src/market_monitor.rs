@@ -2998,6 +2998,7 @@ impl MarketMonitor {
         let sell_pnl = expected_sell_proceeds - filled_cost_basis;
         let sell_size = ((self.fee_adjust_shares(size, filled_price).min(size) * 100.0).floor() / 100.0).max(0.0);
         let mut can_sell_back = sell_size >= min_sell_size;
+        let mut sell_back_blocked_by_relayer = false;
         if can_sell_back && !self.config.mock_currency {
             let rpc = crate::clob_client::POLYGON_RPCS[0];
             let holder = self.client.maker_address();
@@ -3005,8 +3006,9 @@ impl MarketMonitor {
                 Ok(on_chain) => {
                     if on_chain + 0.01 < sell_size {
                         can_sell_back = false;
+                        sell_back_blocked_by_relayer = true;
                         self.log_action(&format!(
-                            "⏭ Imbalance sell-back deferred: on-chain balance {:.2} < sellable {:.2} (relayer delay); forcing BUY hedge.",
+                            "⏭ Imbalance sell-back deferred: on-chain balance {:.2} < sellable {:.2} (relayer delay).",
                             on_chain, sell_size
                         ))
                         .await;
@@ -3020,9 +3022,29 @@ impl MarketMonitor {
                 }
             }
         }
+
+        if sell_back_blocked_by_relayer {
+            let relayer_grace_secs = Self::env_u64("IMBALANCE_RELAYER_GRACE_SECS", 12).max(1);
+            let relayer_retry_secs = Self::env_u64("IMBALANCE_RELAYER_RETRY_SECS", 6).max(1);
+            let recent_activity = self
+                .last_position_activity_at
+                .map(|t| t.elapsed() <= Duration::from_secs(relayer_grace_secs))
+                .unwrap_or(false);
+            if recent_activity {
+                self.hedge_cooldown_until =
+                    Some(Instant::now() + Duration::from_secs(relayer_retry_secs));
+                self.log_action(&format!(
+                    "⏳ Imbalance hedge deferred for {}s (waiting relayer settlement; avoiding forced BUY hedge).",
+                    relayer_retry_secs
+                ))
+                .await;
+                return;
+            }
+        }
+
         let sell_back = can_sell_back && sell_pnl >= hedge_pnl;
 
-        if !can_sell_back {
+        if !can_sell_back && !sell_back_blocked_by_relayer {
             self.log_action(&format!(
                 "⏭ Imbalance sell-back skipped: sellable {:.3} < min {:.1} shares; using BUY hedge path.",
                 sell_size, min_sell_size
@@ -3779,6 +3801,33 @@ impl MarketMonitor {
                     "✅ {strategy_label} fill: UP {yes_filled:.2} | DOWN {no_filled:.2}"
                 ))
                 .await;
+
+                // Safety guard: once a resting quote starts filling, clear remaining
+                // resting orders so inventory cannot cascade while hedge/reconcile runs.
+                let mut cancelled_resting_quotes = false;
+                match self.config.strategy_mode {
+                    StrategyMode::Maker => {
+                        if let Some(ref mut maker) = self.maker {
+                            if maker.has_open_orders() {
+                                let _ = maker.cancel_all(&self.client).await;
+                                cancelled_resting_quotes = true;
+                            }
+                        }
+                    }
+                    StrategyMode::PostOnly => {
+                        if let Some(ref mut strategy) = self.post_only {
+                            if strategy.has_open_orders() {
+                                let _ = strategy.cancel_all(&self.client).await;
+                                cancelled_resting_quotes = true;
+                            }
+                        }
+                    }
+                    StrategyMode::Taker => {}
+                }
+                if cancelled_resting_quotes {
+                    self.log_action("🛑 Resting quotes cancelled after fill; waiting for neutral inventory.")
+                        .await;
+                }
 
                 let fire_amount = self.mergeable_available();
                 if fire_amount >= 1.0 {
