@@ -321,7 +321,11 @@ impl ClobClient {
             }
             Err(e) => {
                 let text = e.to_string();
-                if text.contains("not filled") || text.contains("No matching") {
+                let text_lc = text.to_ascii_lowercase();
+                if text_lc.contains("not filled")
+                    || text_lc.contains("no matching")
+                    || text_lc.contains("no orders found to match")
+                {
                     return Ok(OrderResponse {
                         order_id: String::new(),
                         status: Some("UNMATCHED".to_string()),
