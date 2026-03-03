@@ -9,7 +9,9 @@ A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScr
 - **GTC batched execution** — signs both legs concurrently and submits paired legs with harder-to-fill-first ordering
 - **Partial-fill recovery** — smart hedge-or-sell-back when only one leg fills
 - **Strict-neutral entry lock** — new entries are blocked until inventory ambiguity/imbalance is resolved
+- **Hedge-failure risk lock** — auto-pauses new entries when recent hedge attempts are persistently failing
 - **Hard timeout recovery lock** — ambiguous submit timeouts trigger deterministic recovery before resuming
+- **Runtime wake recovery** — detects long runtime pauses (sleep/unlock) and forces WS/discovery reconnect
 - **WebSocket orderbook feed** — real-time updates from Polymarket's WS API with REST fallback
 - **Strategy selector** — choose `post-only` (new market-maker mode), `taker`, or legacy `maker`
 - **Dynamic fee calculation** — `fee = CLOB_FEE_RATE × (price × (1 − price))^CLOB_FEE_EXPONENT`
@@ -75,6 +77,7 @@ Key parameters:
 | `MIN_IMBALANCE_BUY_SHARES` | `1` | Minimum BUY hedge size for imbalance neutralization |
 | `MIN_IMBALANCE_SELL_SHARES` | `5` | Minimum SELL hedge size for imbalance sell-back paths |
 | `MIN_NET_PROFIT_USD` | `0.08` | Minimum profit threshold |
+| `RESTING_MIN_EDGE_PER_SHARE` | `0.01` | Minimum edge floor for `maker`/`post-only` quote posting |
 | `STRICT_NEUTRAL_MODE` | `true` | Block new entries while imbalance/recovery lock is active |
 | `NEUTRALITY_RESUME_NET_SHARES` | `0.25` | Resume only when net imbalance is at or below this |
 | `TIMEOUT_RECOVERY_LOCK_SECS` | `10` | Lock duration for post-timeout deterministic recovery |

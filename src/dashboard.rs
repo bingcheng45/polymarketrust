@@ -47,6 +47,12 @@ pub struct DashboardState<'a> {
     pub fees_gas_estimate: f64,
     pub execution_success_count: u64,
     pub economic_success_count: u64,
+    pub adaptive_pressure: f64,
+    pub adaptive_window_samples: usize,
+    pub adaptive_hedge_samples: usize,
+    pub adaptive_hedge_failure_ratio: Option<f64>,
+    pub adaptive_min_profit_usd: f64,
+    pub adaptive_max_trade_size: f64,
     pub carry_naked_yes: f64,
     pub carry_naked_no: f64,
     pub carry_worst_case_loss: f64,
@@ -267,6 +273,19 @@ impl Dashboard {
             out.push_str(&format!(
                 "   Success split: execution {} | economic {}\n",
                 state.execution_success_count, state.economic_success_count
+            ));
+            let hedge_fail_pct = state
+                .adaptive_hedge_failure_ratio
+                .map(|r| format!("{:.0}%", r * 100.0))
+                .unwrap_or_else(|| "n/a".to_string());
+            out.push_str(&format!(
+                "   Learn state: pressure {:.0}% | min profit ${:.3} | max size {:.1} | samples opp/hedge {}/{} | hedge fail {}\n",
+                state.adaptive_pressure * 100.0,
+                state.adaptive_min_profit_usd,
+                state.adaptive_max_trade_size,
+                state.adaptive_window_samples,
+                state.adaptive_hedge_samples,
+                hedge_fail_pct
             ));
             out.push_str(&format!(
                 "   Carry Risk: naked Up {:.3} | naked Down {:.3} | worst-case directional loss ${:.2}\n",

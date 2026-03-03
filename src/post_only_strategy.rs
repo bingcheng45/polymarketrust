@@ -48,6 +48,7 @@ impl PostOnlyStrategy {
         yes_bid: f64,
         no_bid: f64,
         fee_rate_bps: u64,
+        balance_usdc: f64,
     ) -> Result<bool> {
         let spread_ticks = self.config.maker_spread_ticks as f64 * market.tick_size;
         let price_floor = market.tick_size.max(0.01);
@@ -83,7 +84,13 @@ impl PostOnlyStrategy {
         self.no_net_filled = 0.0;
 
         self.fee_enabled = fee_rate_bps > 0;
-        let size = self.quote_order_size(yes_bid_px, no_bid_px);
+        let size = self.quote_order_size(yes_bid_px, no_bid_px, balance_usdc);
+        if size <= 0.0 {
+            info!(
+                "Post-only: quote skipped (insufficient balance ${balance_usdc:.2} for min viable paired size)"
+            );
+            return Ok(false);
+        }
         let yes_order = client
             .sign_order_with_post_only(
                 &market.tokens.yes,
@@ -186,7 +193,7 @@ impl PostOnlyStrategy {
         self.yes_order_id.is_some() || self.no_order_id.is_some()
     }
 
-    fn quote_order_size(&self, yes_price: f64, no_price: f64) -> f64 {
+    fn quote_order_size(&self, yes_price: f64, no_price: f64, balance_usdc: f64) -> f64 {
         let min_sellable = std::env::var("MIN_PAIRED_SHARES")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -196,8 +203,18 @@ impl PostOnlyStrategy {
         let max_fee = self.effective_fee(yes_price).max(self.effective_fee(no_price));
         let denom = (1.0 - max_fee).max(0.000_001);
         let min_gross_for_sellable = (((min_sellable + 0.01) / denom) * 100.0).ceil() / 100.0;
-
-        self.config.min_liquidity_size.max(min_gross_for_sellable)
+        let pair_price = (yes_price + no_price).max(0.000_001);
+        let spendable = (balance_usdc * 0.98).max(0.0);
+        let balance_cap = ((spendable / pair_price) * 100.0).floor() / 100.0;
+        let size_cap = self.config.max_trade_size.max(0.0);
+        let hard_cap = balance_cap.min(size_cap);
+        if hard_cap + 1e-9 < min_gross_for_sellable {
+            return 0.0;
+        }
+        self.config
+            .min_liquidity_size
+            .max(min_gross_for_sellable)
+            .min(hard_cap)
     }
 
     fn net_size_after_fee(&self, gross_size: f64, price: f64) -> f64 {

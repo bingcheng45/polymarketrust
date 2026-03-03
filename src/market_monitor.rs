@@ -83,12 +83,22 @@ const ENTRY_LOCK_RECONCILE_DRIFT_STREAK: u32 = 2;
 const ENTRY_LOCK_LOG_INTERVAL_SECS: u64 = 5;
 const DISCOVERY_DEGRADED_WARN_INTERVAL_SECS: u64 = 60;
 const ADAPTIVE_WINDOW_SIZE: usize = 30;
-const ADAPTIVE_MIN_COMPLETION_RATIO: f64 = 0.20;
-const ADAPTIVE_MIN_PROFIT_STEP: f64 = 0.02;
+const ADAPTIVE_MIN_WINDOW_SAMPLES: usize = 8;
+const ADAPTIVE_HEDGE_WINDOW_SIZE: usize = 24;
+const ADAPTIVE_TARGET_COMPLETION_RATIO: f64 = 0.65;
+const ADAPTIVE_TARGET_ECONOMIC_RATIO: f64 = 0.55;
+const ADAPTIVE_NEG_PNL_SCALE_USD: f64 = 0.25;
+const ADAPTIVE_PRESSURE_SMOOTHING: f64 = 0.35;
 const ADAPTIVE_MIN_PROFIT_CAP: f64 = 0.14;
-const ADAPTIVE_MAX_SIZE_STEP: f64 = 2.0;
 const ADAPTIVE_MIN_SIZE_FLOOR: f64 = 5.0;
+const ADAPTIVE_LOG_MIN_PROFIT_DELTA: f64 = 0.005;
+const ADAPTIVE_LOG_MIN_SIZE_DELTA: f64 = 0.25;
+const HEDGE_FAILURE_LOCK_MIN_SAMPLES: usize = 12;
+const HEDGE_FAILURE_LOCK_RATIO: f64 = 0.70;
+const HEDGE_FAILURE_LOCK_TTL_SECS: u64 = 300;
 const REST_RECOVERY_POLL_LOOKBACK_MAX_TRADES: usize = 200;
+const RUNTIME_RESUME_GAP_SECS: u64 = 20;
+const RUNTIME_RESUME_RECOVERY_DEBOUNCE_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryLockReason {
@@ -96,6 +106,7 @@ enum EntryLockReason {
     TimeoutRecovery,
     AmbiguousFill,
     ReconcileDrift,
+    HedgeFailureRisk,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,6 +121,12 @@ struct ActionableBookSnapshot {
     no_ask: f64,
     yes_size: f64,
     no_size: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpportunityOutcome {
+    completed: bool,
+    pnl: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +196,8 @@ pub struct MarketMonitor {
     discovery_failure_since: Option<Instant>,
     last_discovery_degraded_warn_at: Option<Instant>,
     force_claim_scan: bool,
+    last_runtime_tick: Instant,
+    last_resume_recovery_at: Option<Instant>,
 
     // Last time we checked for opportunity
     last_check: Option<Instant>,
@@ -250,7 +269,10 @@ pub struct MarketMonitor {
     reconcile_drift_streak: u32,
     adaptive_min_profit_usd: f64,
     adaptive_max_trade_size: f64,
-    recent_opportunity_completion: VecDeque<bool>,
+    adaptive_pressure: f64,
+    recent_opportunity_outcomes: VecDeque<OpportunityOutcome>,
+    recent_hedge_outcomes: VecDeque<bool>,
+    last_hedge_outcome_at: Option<Instant>,
     last_yes_mid_price: Option<f64>,
     last_no_mid_price: Option<f64>,
     seen_rest_trade_ids: HashSet<String>,
@@ -315,6 +337,8 @@ impl MarketMonitor {
             discovery_failure_since: None,
             last_discovery_degraded_warn_at: None,
             force_claim_scan: false,
+            last_runtime_tick: Instant::now(),
+            last_resume_recovery_at: None,
             last_check: None,
             errors: Vec::new(),
             is_redeeming: Arc::new(AtomicBool::new(false)),
@@ -373,7 +397,10 @@ impl MarketMonitor {
             reconcile_drift_streak: 0,
             adaptive_min_profit_usd,
             adaptive_max_trade_size,
-            recent_opportunity_completion: VecDeque::with_capacity(ADAPTIVE_WINDOW_SIZE + 1),
+            adaptive_pressure: 0.0,
+            recent_opportunity_outcomes: VecDeque::with_capacity(ADAPTIVE_WINDOW_SIZE + 1),
+            recent_hedge_outcomes: VecDeque::with_capacity(ADAPTIVE_HEDGE_WINDOW_SIZE + 1),
+            last_hedge_outcome_at: None,
             last_yes_mid_price: None,
             last_no_mid_price: None,
             seen_rest_trade_ids: HashSet::new(),
@@ -618,6 +645,50 @@ impl MarketMonitor {
         }
     }
 
+    async fn maybe_recover_after_runtime_pause(&mut self) {
+        let now = Instant::now();
+        let gap = now.saturating_duration_since(self.last_runtime_tick);
+        self.last_runtime_tick = now;
+        if gap.as_secs() < RUNTIME_RESUME_GAP_SECS {
+            return;
+        }
+
+        let recently_recovered = self
+            .last_resume_recovery_at
+            .map(|t| t.elapsed().as_secs() < RUNTIME_RESUME_RECOVERY_DEBOUNCE_SECS)
+            .unwrap_or(false);
+        if recently_recovered {
+            return;
+        }
+        self.last_resume_recovery_at = Some(now);
+
+        self.log_action(&format!(
+            "🔄 Runtime pause detected ({}s). Forcing network/WS recovery.",
+            gap.as_secs()
+        ))
+        .await;
+
+        self.last_tick_signature = None;
+        self.last_actionable_snapshot = None;
+        self.ws_reconnect_requested = true;
+        self.ws_stale_warned = false;
+        self.ws_stale_consecutive = 0;
+        self.last_ws_age_sample = None;
+
+        // After wake, run discovery immediately instead of waiting for next due window.
+        self.last_market_discovery_attempt = None;
+        self.try_find_active_market_if_due().await;
+
+        if self.config.ws_enabled
+            && self.market_info.is_some()
+            && (self.ws_client.is_none() || self.ws_reconnect_requested)
+        {
+            self.connect_ws_for_active_market(true).await;
+        }
+
+        self.request_render();
+    }
+
     async fn connect_ws_for_active_market(&mut self, is_reconnect: bool) {
         if !self.config.ws_enabled {
             return;
@@ -629,7 +700,7 @@ impl MarketMonitor {
         };
 
         if is_reconnect {
-            self.log_action("📡 Re-initialising WebSocket for new market...")
+            self.log_action("📡 Re-initialising WebSocket connection...")
                 .await;
         }
 
@@ -741,6 +812,7 @@ impl MarketMonitor {
     pub async fn check_opportunity(&mut self) {
         // Note: rate-limiting is now controlled by the caller (main.rs)
         // via WS-driven 20ms throttle + 1s REST fallback.
+        self.maybe_recover_after_runtime_pause().await;
         self.last_check = Some(Instant::now());
         self.process_merge_results().await;
 
@@ -901,7 +973,32 @@ impl MarketMonitor {
             return;
         }
 
+        if self.config.uses_resting_orders() {
+            let resting_min_edge = Self::env_f64("RESTING_MIN_EDGE_PER_SHARE", 0.01).max(0.0);
+            if net_spread < resting_min_edge {
+                self.checks_skipped_profit = self.checks_skipped_profit.saturating_add(1);
+                self.log_action_fast(&format!(
+                    "🧾 ORDER SEND: NO — resting edge ${net_spread:.3}/share below floor ${resting_min_edge:.3}/share."
+                ));
+                self.request_render();
+                return;
+            }
+        }
+
         // Resting-quote strategies: post/update bids instead of taker crossing.
+        let quote_balance_usdc = if self.config.mock_currency {
+            1000.0
+        } else {
+            self.last_balance
+                .or_else(|| {
+                    if self.session_start_balance > 0.0 {
+                        Some(self.session_start_balance)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0.0)
+        };
         match self.config.strategy_mode {
             StrategyMode::Maker => {
                 self.log_action_fast(
@@ -915,7 +1012,14 @@ impl MarketMonitor {
                     };
                     let fee_bps = (active_fee_rate * 10_000.0).round() as u64;
                     let _ = maker
-                        .update_orders(&self.client, &mi, yes_ask, no_ask, fee_bps)
+                        .update_orders(
+                            &self.client,
+                            &mi,
+                            yes_ask,
+                            no_ask,
+                            fee_bps,
+                            quote_balance_usdc,
+                        )
                         .await;
                 }
                 self.request_render();
@@ -947,6 +1051,7 @@ impl MarketMonitor {
                             yes_bid,
                             no_bid,
                             fee_bps,
+                            quote_balance_usdc,
                         )
                         .await;
                 }
@@ -1298,6 +1403,21 @@ impl MarketMonitor {
                 failed_batches,
                 recorded_pnl
             ));
+            let pair_cost = opp.yes_price + opp.no_price;
+            let raw_edge = 1.0 - pair_cost;
+            let hedge_fail = self
+                .adaptive_hedge_failure_ratio()
+                .map(|r| format!("{:.0}%", r * 100.0))
+                .unwrap_or_else(|| "n/a".to_string());
+            self.log_action_fast(&format!(
+                "🧪 Outcome context: pair ${pair_cost:.3}/share (raw edge ${raw_edge:.3}), size {:.1}, ws age up/down {}ms/{}ms, adaptive min profit ${:.3}, adaptive max size {:.1}, hedge fail {}",
+                total_size,
+                self.ws_yes_age_ms.unwrap_or(9999),
+                self.ws_no_age_ms.unwrap_or(9999),
+                self.effective_min_profit_usd(),
+                self.effective_max_trade_size(),
+                hedge_fail
+            ));
         }
     }
 
@@ -1315,7 +1435,7 @@ impl MarketMonitor {
         let recorded_pnl = if opportunity_success { total_profit } else { 0.0 };
         self.stats
             .record_execution(opportunity_success, recorded_pnl);
-        self.update_adaptive_stability_controls(opportunity_success);
+        self.update_adaptive_stability_controls(opportunity_success, total_profit);
 
         if opportunity_success {
             self.consecutive_failures = 0;
@@ -2269,6 +2389,8 @@ impl MarketMonitor {
             .await
         };
 
+        self.record_hedge_outcome(result.is_ok());
+
         if let Err(e) = &result {
             // Rescue failed: retain observed partial inventory in memory so dashboard reflects reality.
             if yes_filled > 0.0 {
@@ -2625,6 +2747,16 @@ impl MarketMonitor {
             proceeds - filled_cost
         } else {
             // Hedge: buy missing leg
+            let affordable_target_net = self.affordable_net_buy_shares(missing_price);
+            let hedge_target_net = hedge_target_net.min(affordable_target_net);
+            if hedge_target_net + 0.01 < min_buy_size {
+                anyhow::bail!(
+                    "rescue hedge skipped: affordable net {:.2} < min {:.2} (balance ${:.2})",
+                    hedge_target_net,
+                    min_buy_size,
+                    self.last_balance.unwrap_or(0.0)
+                );
+            }
             let (gross_hedge_matched, hedge_received, gross_hedge_cost, resolved) = self
                 .execute_buy_hedge_ladder(
                     missing_token_id,
@@ -2914,6 +3046,7 @@ impl MarketMonitor {
                             }
                             self.consecutive_hedge_failures = 0;
                             self.hedge_cooldown_until = None;
+                            self.record_hedge_outcome(true);
                             self.log_action(&format!(
                                 "✅ Imbalance sell-back fill: -{reduced:.2} {filled_label} @ {:.2}",
                                 sell_back_price
@@ -2932,6 +3065,7 @@ impl MarketMonitor {
                         warn!("Imbalance sell-back failed: {}", Self::format_error_chain(&e));
                         if Self::is_balance_allowance_rejection(&e) {
                             self.hedge_cooldown_until = None;
+                            self.record_hedge_outcome(false);
                             self.log_action(
                                 "⚠️ Imbalance sell-back rejected (balance/allowance). Keeping smart-hedge mode.",
                             )
@@ -2949,12 +3083,37 @@ impl MarketMonitor {
                 },
                 Err(e) => {
                     warn!("Imbalance sell-back sign failed: {}", Self::format_error_chain(&e));
+                    self.record_hedge_outcome(false);
                     let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 160);
                     self.log_action(&format!("⚠️ Imbalance sell-back sign failed ({reason})"))
                         .await;
                 }
             }
         } else {
+            let affordable_target_net = self.affordable_net_buy_shares(missing_price);
+            let hedge_target_net = hedge_target_net.min(affordable_target_net);
+            if hedge_target_net + 0.01 < min_buy_size {
+                self.hedge_cooldown_until =
+                    Some(Instant::now() + Duration::from_secs(IMBALANCE_DUST_RECHECK_SECS));
+                self.log_action(&format!(
+                    "⏭ Imbalance BUY hedge skipped: affordable net {:.2} < min {:.2} (balance ${:.2}); retry in {}s.",
+                    hedge_target_net,
+                    min_buy_size,
+                    self.last_balance.unwrap_or(0.0),
+                    IMBALANCE_DUST_RECHECK_SECS
+                ))
+                .await;
+                return;
+            }
+            if hedge_target_net + 0.01 < size {
+                self.log_action(&format!(
+                    "⚖️ Imbalance BUY hedge size capped by balance: target {:.2} → {:.2} net shares.",
+                    size,
+                    hedge_target_net
+                ))
+                .await;
+            }
+
             let (gross_hedge_matched, hedge_received, gross_hedge_cost, resolved) = match self
                 .execute_buy_hedge_ladder(
                     missing_token,
@@ -3011,6 +3170,9 @@ impl MarketMonitor {
                 }
                 self.consecutive_hedge_failures = 0;
                 self.hedge_cooldown_until = None;
+                if resolved {
+                    self.record_hedge_outcome(true);
+                }
                 self.log_action(&format!(
                     "✅ Imbalance hedge fill: +{added:.2} {} (gross {:.2})",
                     missing_label, gross_hedge_matched
@@ -3037,6 +3199,7 @@ impl MarketMonitor {
 
     fn on_hedge_failure(&mut self) -> u64 {
         self.consecutive_hedge_failures += 1;
+        self.record_hedge_outcome(false);
         let cooldown_secs = (30 * self.consecutive_hedge_failures as u64).min(MAX_HEDGE_COOLDOWN_SECS);
         self.hedge_cooldown_until = Some(Instant::now() + Duration::from_secs(cooldown_secs));
         warn!(
@@ -3598,7 +3761,18 @@ impl MarketMonitor {
                                 }
                                 if !tracked_fill {
                                     if !response_already_applied {
-                                        self.apply_untracked_ws_trade_fill(&ev);
+                                        if self.config.uses_resting_orders() {
+                                            // For maker/post-only, WS trade events can be ambiguous
+                                            // (maker/taker ids may not map cleanly to our local trackers).
+                                            // Avoid directional self-hedge cascades from misattribution and
+                                            // let order polling + reconcile own the inventory truth.
+                                            debug!(
+                                                "Ignoring untracked WS trade in resting mode: {} {} {} @ {}",
+                                                ev.side, ev.size, ev.asset_id, ev.price
+                                            );
+                                        } else {
+                                            self.apply_untracked_ws_trade_fill(&ev);
+                                        }
                                     }
                                 } else if matches!(
                                     tracked_batch_state,
@@ -3674,14 +3848,16 @@ impl MarketMonitor {
     // ─── WS Health Check ──────────────────────────────────────────────────────
 
     pub async fn check_ws_health(&mut self) {
+        self.maybe_recover_after_runtime_pause().await;
         if !self.config.ws_enabled {
             return;
         }
 
-        let mi = match &self.market_info {
-            Some(m) => m.clone(),
-            None => return,
-        };
+        if self.market_info.is_none() {
+            self.try_find_active_market_if_due().await;
+            return;
+        }
+        let mi = self.market_info.clone().expect("market checked above");
 
         if let Some(ref ws) = self.ws_client {
             let yes_age = ws.get_book_age_ms(&mi.tokens.yes).await;
@@ -3954,6 +4130,7 @@ impl MarketMonitor {
             EntryLockReason::TimeoutRecovery => "TimeoutRecovery",
             EntryLockReason::AmbiguousFill => "AmbiguousFill",
             EntryLockReason::ReconcileDrift => "ReconcileDrift",
+            EntryLockReason::HedgeFailureRisk => "HedgeFailureRisk",
         }
     }
 
@@ -3969,12 +4146,40 @@ impl MarketMonitor {
         self.reconcile_drift_streak >= ENTRY_LOCK_RECONCILE_DRIFT_STREAK
     }
 
+    fn hedge_failure_lock_active(&self) -> bool {
+        let Some(last_outcome) = self.last_hedge_outcome_at else {
+            return false;
+        };
+        if last_outcome.elapsed().as_secs() > HEDGE_FAILURE_LOCK_TTL_SECS {
+            return false;
+        }
+        if self.recent_hedge_outcomes.len() < HEDGE_FAILURE_LOCK_MIN_SAMPLES {
+            return false;
+        }
+        self.adaptive_hedge_failure_ratio().unwrap_or(0.0) >= HEDGE_FAILURE_LOCK_RATIO
+    }
+
     fn effective_max_trade_size(&self) -> f64 {
-        self.adaptive_max_trade_size.max(ADAPTIVE_MIN_SIZE_FLOOR)
+        let configured_cap = self.config.max_trade_size.max(0.0);
+        let floor = ADAPTIVE_MIN_SIZE_FLOOR.min(configured_cap);
+        self.adaptive_max_trade_size.max(floor).min(configured_cap)
     }
 
     fn effective_min_profit_usd(&self) -> f64 {
         self.adaptive_min_profit_usd.max(0.0)
+    }
+
+    fn affordable_net_buy_shares(&self, price: f64) -> f64 {
+        if price <= 0.0 {
+            return 0.0;
+        }
+        let balance = self.last_balance.unwrap_or(0.0).max(0.0);
+        if balance <= 0.0 {
+            return 0.0;
+        }
+        let spendable = (balance * 0.98).max(0.0);
+        let gross_affordable = ((spendable / price) * 100.0).floor() / 100.0;
+        self.fee_adjust_shares(gross_affordable, price).max(0.0)
     }
 
     fn sync_daily_pnl_from_components(&mut self) {
@@ -3996,39 +4201,129 @@ impl MarketMonitor {
         self.sync_daily_pnl_from_components();
     }
 
-    fn update_adaptive_stability_controls(&mut self, completed: bool) {
-        self.recent_opportunity_completion.push_back(completed);
-        while self.recent_opportunity_completion.len() > ADAPTIVE_WINDOW_SIZE {
-            self.recent_opportunity_completion.pop_front();
+    fn update_adaptive_stability_controls(&mut self, completed: bool, pnl: f64) {
+        self.recent_opportunity_outcomes
+            .push_back(OpportunityOutcome { completed, pnl });
+        while self.recent_opportunity_outcomes.len() > ADAPTIVE_WINDOW_SIZE {
+            self.recent_opportunity_outcomes.pop_front();
         }
-        if self.recent_opportunity_completion.len() < ADAPTIVE_WINDOW_SIZE {
+        self.recompute_adaptive_controls();
+    }
+
+    fn record_hedge_outcome(&mut self, success: bool) {
+        self.recent_hedge_outcomes.push_back(success);
+        self.last_hedge_outcome_at = Some(Instant::now());
+        while self.recent_hedge_outcomes.len() > ADAPTIVE_HEDGE_WINDOW_SIZE {
+            self.recent_hedge_outcomes.pop_front();
+        }
+        self.recompute_adaptive_controls();
+    }
+
+    fn adaptive_hedge_failure_ratio(&self) -> Option<f64> {
+        if self.recent_hedge_outcomes.is_empty() {
+            return None;
+        }
+        let failures = self.recent_hedge_outcomes.iter().filter(|ok| !**ok).count() as f64;
+        Some(failures / self.recent_hedge_outcomes.len() as f64)
+    }
+
+    fn recompute_adaptive_controls(&mut self) {
+        let sample_count = self.recent_opportunity_outcomes.len();
+        let hedge_sample_count = self.recent_hedge_outcomes.len();
+        if sample_count < ADAPTIVE_MIN_WINDOW_SAMPLES
+            && hedge_sample_count < ADAPTIVE_MIN_WINDOW_SAMPLES
+        {
             return;
         }
 
         let completed_count = self
-            .recent_opportunity_completion
+            .recent_opportunity_outcomes
             .iter()
-            .filter(|x| **x)
-            .count() as f64;
-        let completion_ratio = completed_count / ADAPTIVE_WINDOW_SIZE as f64;
-        if completion_ratio >= ADAPTIVE_MIN_COMPLETION_RATIO {
-            return;
+            .filter(|o| o.completed)
+            .count();
+        let completion_ratio = if sample_count > 0 {
+            completed_count as f64 / sample_count as f64
+        } else {
+            ADAPTIVE_TARGET_COMPLETION_RATIO
+        };
+
+        let (economic_success_count, completed_pnl_sum) = self
+            .recent_opportunity_outcomes
+            .iter()
+            .filter(|o| o.completed)
+            .fold((0usize, 0.0_f64), |(wins, pnl_sum), o| {
+                let is_profit = if o.pnl > 0.0 { 1 } else { 0 };
+                (wins + is_profit, pnl_sum + o.pnl)
+            });
+        let economic_ratio = if completed_count > 0 {
+            economic_success_count as f64 / completed_count as f64
+        } else {
+            ADAPTIVE_TARGET_ECONOMIC_RATIO
+        };
+        let avg_completed_pnl = if completed_count > 0 {
+            completed_pnl_sum / completed_count as f64
+        } else {
+            0.0
+        };
+        let hedge_failure_ratio = self.adaptive_hedge_failure_ratio().unwrap_or(0.0);
+
+        let completion_penalty = ((ADAPTIVE_TARGET_COMPLETION_RATIO - completion_ratio)
+            / ADAPTIVE_TARGET_COMPLETION_RATIO)
+            .clamp(0.0, 1.0);
+        let economic_penalty =
+            ((ADAPTIVE_TARGET_ECONOMIC_RATIO - economic_ratio) / ADAPTIVE_TARGET_ECONOMIC_RATIO)
+                .clamp(0.0, 1.0);
+        let pnl_penalty = if avg_completed_pnl < 0.0 {
+            (-avg_completed_pnl / ADAPTIVE_NEG_PNL_SCALE_USD).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let hedge_penalty = hedge_failure_ratio.clamp(0.0, 1.0);
+
+        let mut target_pressure =
+            (completion_penalty * 0.40 + economic_penalty * 0.25 + pnl_penalty * 0.20
+                + hedge_penalty * 0.15)
+                .clamp(0.0, 1.0);
+        if sample_count == 0 && hedge_sample_count >= ADAPTIVE_MIN_WINDOW_SAMPLES {
+            target_pressure = target_pressure.max((hedge_failure_ratio * 0.90).clamp(0.0, 1.0));
         }
+        if hedge_sample_count >= HEDGE_FAILURE_LOCK_MIN_SAMPLES
+            && hedge_failure_ratio >= HEDGE_FAILURE_LOCK_RATIO
+        {
+            target_pressure = target_pressure.max(0.80);
+        }
+
+        self.adaptive_pressure = (self.adaptive_pressure * (1.0 - ADAPTIVE_PRESSURE_SMOOTHING)
+            + target_pressure * ADAPTIVE_PRESSURE_SMOOTHING)
+            .clamp(0.0, 1.0);
 
         let prev_min_profit = self.adaptive_min_profit_usd;
         let prev_max_size = self.adaptive_max_trade_size;
-        self.adaptive_min_profit_usd =
-            (self.adaptive_min_profit_usd + ADAPTIVE_MIN_PROFIT_STEP).min(ADAPTIVE_MIN_PROFIT_CAP);
-        self.adaptive_max_trade_size =
-            (self.adaptive_max_trade_size - ADAPTIVE_MAX_SIZE_STEP).max(ADAPTIVE_MIN_SIZE_FLOOR);
 
-        if (self.adaptive_min_profit_usd - prev_min_profit).abs() > f64::EPSILON
-            || (self.adaptive_max_trade_size - prev_max_size).abs() > f64::EPSILON
-        {
+        let base_min_profit = self.config.min_net_profit_usd.max(0.0);
+        let min_profit_cap = ADAPTIVE_MIN_PROFIT_CAP.max(base_min_profit);
+        let min_profit_span = (min_profit_cap - base_min_profit).max(0.0);
+        let next_min_profit = base_min_profit + min_profit_span * self.adaptive_pressure;
+
+        let size_floor = ADAPTIVE_MIN_SIZE_FLOOR.min(self.config.max_trade_size).max(0.0);
+        let size_span = (self.config.max_trade_size - size_floor).max(0.0);
+        let next_max_size = (self.config.max_trade_size - size_span * self.adaptive_pressure).max(size_floor);
+
+        self.adaptive_min_profit_usd = next_min_profit;
+        self.adaptive_max_trade_size = next_max_size;
+
+        let min_profit_changed =
+            (self.adaptive_min_profit_usd - prev_min_profit).abs() >= ADAPTIVE_LOG_MIN_PROFIT_DELTA;
+        let max_size_changed =
+            (self.adaptive_max_trade_size - prev_max_size).abs() >= ADAPTIVE_LOG_MIN_SIZE_DELTA;
+        if min_profit_changed || max_size_changed {
             self.log_action_fast(&format!(
-                "🛡 Stability auto-tighten: completion {:.0}% over last {} opps → min profit ${:.2}, max size {:.0}",
+                "🧠 Adaptive learn: pressure {:.0}% | exec {:.0}% | econ {:.0}% | hedge fail {:.0}% | avg pnl ${:+.3} → min profit ${:.3}, max size {:.1}",
+                self.adaptive_pressure * 100.0,
                 completion_ratio * 100.0,
-                ADAPTIVE_WINDOW_SIZE,
+                economic_ratio * 100.0,
+                hedge_failure_ratio * 100.0,
+                avg_completed_pnl,
                 self.adaptive_min_profit_usd,
                 self.adaptive_max_trade_size
             ));
@@ -4074,6 +4369,11 @@ impl MarketMonitor {
 
         if self.reconcile_drift_lock_active() {
             self.entry_lock_reason = Some(EntryLockReason::ReconcileDrift);
+            return;
+        }
+
+        if self.hedge_failure_lock_active() {
+            self.entry_lock_reason = Some(EntryLockReason::HedgeFailureRisk);
             return;
         }
 
@@ -5110,6 +5410,12 @@ impl MarketMonitor {
             fees_gas_estimate: self.fees_gas_estimate,
             execution_success_count: self.execution_success_count,
             economic_success_count: self.economic_success_count,
+            adaptive_pressure: self.adaptive_pressure,
+            adaptive_window_samples: self.recent_opportunity_outcomes.len(),
+            adaptive_hedge_samples: self.recent_hedge_outcomes.len(),
+            adaptive_hedge_failure_ratio: self.adaptive_hedge_failure_ratio(),
+            adaptive_min_profit_usd: self.adaptive_min_profit_usd,
+            adaptive_max_trade_size: self.adaptive_max_trade_size,
             carry_naked_yes,
             carry_naked_no,
             carry_worst_case_loss,
@@ -5247,6 +5553,8 @@ mod tests {
             discovery_failure_since: None,
             last_discovery_degraded_warn_at: None,
             force_claim_scan: false,
+            last_runtime_tick: Instant::now(),
+            last_resume_recovery_at: None,
             last_check: None,
             errors: Vec::new(),
             is_redeeming: Arc::new(AtomicBool::new(false)),
@@ -5306,7 +5614,10 @@ mod tests {
             reconcile_drift_streak: 0,
             adaptive_min_profit_usd: config.min_net_profit_usd,
             adaptive_max_trade_size: config.max_trade_size,
-            recent_opportunity_completion: VecDeque::new(),
+            adaptive_pressure: 0.0,
+            recent_opportunity_outcomes: VecDeque::new(),
+            recent_hedge_outcomes: VecDeque::new(),
+            last_hedge_outcome_at: None,
             last_yes_mid_price: None,
             last_no_mid_price: None,
             seen_rest_trade_ids: HashSet::new(),
@@ -5636,6 +5947,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_adaptive_learning_tightens_after_repeated_failures() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.config = Arc::new(Config {
+            min_net_profit_usd: 0.02,
+            max_trade_size: 100.0,
+            ..(*monitor.config).clone()
+        });
+        monitor.adaptive_min_profit_usd = 0.02;
+        monitor.adaptive_max_trade_size = 100.0;
+
+        for _ in 0..ADAPTIVE_WINDOW_SIZE {
+            monitor.update_adaptive_stability_controls(false, 0.0);
+        }
+        for _ in 0..ADAPTIVE_HEDGE_WINDOW_SIZE {
+            monitor.record_hedge_outcome(false);
+        }
+
+        assert!(monitor.adaptive_pressure > 0.2);
+        assert!(monitor.adaptive_min_profit_usd > 0.02);
+        assert!(monitor.adaptive_max_trade_size < 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_learning_relaxes_after_winning_streak() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.config = Arc::new(Config {
+            min_net_profit_usd: 0.02,
+            max_trade_size: 100.0,
+            ..(*monitor.config).clone()
+        });
+        monitor.adaptive_min_profit_usd = 0.02;
+        monitor.adaptive_max_trade_size = 100.0;
+
+        for _ in 0..ADAPTIVE_WINDOW_SIZE {
+            monitor.update_adaptive_stability_controls(false, 0.0);
+        }
+        for _ in 0..ADAPTIVE_HEDGE_WINDOW_SIZE {
+            monitor.record_hedge_outcome(false);
+        }
+        let tightened_min_profit = monitor.adaptive_min_profit_usd;
+        let tightened_max_size = monitor.adaptive_max_trade_size;
+
+        for _ in 0..ADAPTIVE_WINDOW_SIZE {
+            monitor.update_adaptive_stability_controls(true, 0.20);
+        }
+        for _ in 0..ADAPTIVE_HEDGE_WINDOW_SIZE {
+            monitor.record_hedge_outcome(true);
+        }
+
+        assert!(monitor.adaptive_min_profit_usd < tightened_min_profit);
+        assert!(monitor.adaptive_max_trade_size > tightened_max_size);
+    }
+
+    #[tokio::test]
     async fn test_daily_pnl_tracks_balance_delta() {
         let Some(mut monitor) = mock_monitor().await else {
             return;
@@ -5645,5 +6014,44 @@ mod tests {
         monitor.sync_daily_pnl_from_components();
 
         assert!((monitor.daily_pnl - 12.34).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_hedge_failure_only_window_tightens_controls_hard() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.config = Arc::new(Config {
+            min_net_profit_usd: 0.02,
+            max_trade_size: 100.0,
+            ..(*monitor.config).clone()
+        });
+        monitor.adaptive_min_profit_usd = 0.02;
+        monitor.adaptive_max_trade_size = 100.0;
+
+        for _ in 0..ADAPTIVE_HEDGE_WINDOW_SIZE {
+            monitor.record_hedge_outcome(false);
+        }
+
+        assert!(monitor.adaptive_pressure >= 0.75);
+        assert!(monitor.adaptive_min_profit_usd >= 0.10);
+        assert!(monitor.adaptive_max_trade_size <= 30.0);
+    }
+
+    #[tokio::test]
+    async fn test_entry_lock_engages_on_hedge_failure_risk() {
+        let Some(mut monitor) = mock_monitor().await else {
+            return;
+        };
+        monitor.position = Position::default();
+        monitor.unresolved_ambiguous_batches.clear();
+        monitor.reconcile_drift_streak = 0;
+
+        for _ in 0..HEDGE_FAILURE_LOCK_MIN_SAMPLES {
+            monitor.record_hedge_outcome(false);
+        }
+
+        monitor.update_entry_lock_state();
+        assert_eq!(monitor.entry_lock_reason, Some(EntryLockReason::HedgeFailureRisk));
     }
 }
