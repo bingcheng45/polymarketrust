@@ -82,6 +82,7 @@ const RECONCILE_ZERO_SYNC_GRACE_SECS: u64 = 180;
 const ENTRY_LOCK_RECONCILE_DRIFT_STREAK: u32 = 2;
 const ENTRY_LOCK_LOG_INTERVAL_SECS: u64 = 5;
 const DISCOVERY_DEGRADED_WARN_INTERVAL_SECS: u64 = 60;
+const DISCOVERY_SELF_HEAL_MIN_INTERVAL_SECS: u64 = 90;
 const ADAPTIVE_WINDOW_SIZE: usize = 30;
 const ADAPTIVE_MIN_WINDOW_SAMPLES: usize = 8;
 const ADAPTIVE_HEDGE_WINDOW_SIZE: usize = 24;
@@ -195,6 +196,7 @@ pub struct MarketMonitor {
     last_market_discovery_attempt: Option<Instant>,
     discovery_failure_since: Option<Instant>,
     last_discovery_degraded_warn_at: Option<Instant>,
+    last_discovery_self_heal_at: Option<Instant>,
     force_claim_scan: bool,
     last_runtime_tick: Instant,
     last_resume_recovery_at: Option<Instant>,
@@ -336,6 +338,7 @@ impl MarketMonitor {
             last_market_discovery_attempt: None,
             discovery_failure_since: None,
             last_discovery_degraded_warn_at: None,
+            last_discovery_self_heal_at: None,
             force_claim_scan: false,
             last_runtime_tick: Instant::now(),
             last_resume_recovery_at: None,
@@ -586,6 +589,7 @@ impl MarketMonitor {
     fn clear_discovery_degraded_state(&mut self) {
         self.discovery_failure_since = None;
         self.last_discovery_degraded_warn_at = None;
+        self.last_discovery_self_heal_at = None;
     }
 
     async fn maybe_log_discovery_degraded(&mut self) {
@@ -595,19 +599,95 @@ impl MarketMonitor {
         if first_failure.elapsed().as_secs() < self.config.discovery_degraded_secs {
             return;
         }
-        let due = self
+        let warn_due = self
             .last_discovery_degraded_warn_at
             .map(|t| t.elapsed().as_secs() >= DISCOVERY_DEGRADED_WARN_INTERVAL_SECS)
             .unwrap_or(true);
-        if !due {
+        if warn_due {
+            self.last_discovery_degraded_warn_at = Some(Instant::now());
+            self.log_action(&format!(
+                "⚠️ Discovery degraded >{}s: Gamma /events + /markets failing. Holding in retry mode.",
+                self.config.discovery_degraded_secs
+            ))
+            .await;
+        }
+
+        self.maybe_attempt_discovery_self_heal().await;
+    }
+
+    async fn maybe_attempt_discovery_self_heal(&mut self) {
+        let Some(first_failure) = self.discovery_failure_since else {
+            return;
+        };
+        if first_failure.elapsed().as_secs() < self.config.discovery_degraded_secs {
             return;
         }
-        self.last_discovery_degraded_warn_at = Some(Instant::now());
-        self.log_action(&format!(
-            "⚠️ Discovery degraded >{}s: Gamma /events + /markets failing. Holding in retry mode.",
-            self.config.discovery_degraded_secs
-        ))
+
+        let heal_due = self
+            .last_discovery_self_heal_at
+            .map(|t| t.elapsed().as_secs() >= DISCOVERY_SELF_HEAL_MIN_INTERVAL_SECS)
+            .unwrap_or(true);
+        if !heal_due {
+            return;
+        }
+
+        self.last_discovery_self_heal_at = Some(Instant::now());
+        self.log_action(
+            "🔧 Discovery self-heal: rebuilding CLOB client and forcing rediscovery.",
+        )
         .await;
+
+        match ClobClient::new(Arc::clone(&self.config)).await {
+            Ok(new_client) => {
+                self.client = Arc::new(new_client);
+                self.log_action("🔧 Discovery self-heal: CLOB client rebuilt.")
+                    .await;
+            }
+            Err(e) => {
+                warn!("Discovery self-heal failed to rebuild CLOB client: {e}");
+                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
+                self.log_action(&format!(
+                    "⚠️ Discovery self-heal failed: client rebuild error: {reason}"
+                ))
+                .await;
+                return;
+            }
+        }
+
+        self.ws_client = None;
+        self.ws_notify = None;
+        self.ws_yes_age_ms = None;
+        self.ws_no_age_ms = None;
+        self.ws_reconnect_requested = true;
+        self.ws_stale_warned = false;
+        self.ws_stale_consecutive = 0;
+        self.ws_connected_at = None;
+        self.last_ws_age_sample = None;
+        self.last_tick_signature = None;
+        self.last_actionable_snapshot = None;
+
+        self.last_market_discovery_attempt = Some(Instant::now());
+        match self.find_active_market().await {
+            Ok(true) => {
+                self.clear_discovery_degraded_state();
+                self.log_action("✅ Discovery self-heal recovered active market.")
+                    .await;
+                self.connect_ws_for_active_market(true).await;
+            }
+            Ok(false) => {
+                self.clear_discovery_degraded_state();
+                self.log_action("ℹ️ Discovery self-heal completed: no active market right now.")
+                    .await;
+            }
+            Err(e) => {
+                warn!("Discovery self-heal rediscovery attempt failed: {e}");
+                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
+                self.log_action(&format!(
+                    "⚠️ Discovery self-heal rediscovery failed: {reason}"
+                ))
+                .await;
+            }
+        }
     }
 
     async fn try_find_active_market_if_due(&mut self) {
@@ -5552,6 +5632,7 @@ mod tests {
             last_market_discovery_attempt: None,
             discovery_failure_since: None,
             last_discovery_degraded_warn_at: None,
+            last_discovery_self_heal_at: None,
             force_claim_scan: false,
             last_runtime_tick: Instant::now(),
             last_resume_recovery_at: None,
