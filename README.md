@@ -172,6 +172,8 @@ Key parameters:
 | `GAMMA_REQUEST_RETRIES` | `2` | Gamma discovery retry count per query |
 | `GAMMA_RETRY_BASE_MS` | `300` | Base backoff between Gamma retries |
 | `DISCOVERY_DEGRADED_SECS` | `60` | Continuous discovery failure threshold before degraded warning |
+| `DISCOVERY_LAST_GOOD_TTL_SECS` | `180` | Max age of cached market snapshot eligible for discovery fallback |
+| `DISCOVERY_FALLBACK_MIN_REMAINING_SECS` | `30` | Require cached market to have at least this much time left before reuse |
 | `SDK_RETRY_BASE_DELAY_MS` | `60` | Retry backoff base delay |
 | `SDK_RETRY_MAX_DELAY_MS` | `600` | Retry backoff cap |
 | `DISABLE_SYSTEM_PROXY` | `true` | Ignore `HTTP(S)_PROXY` for lower-latency direct path |

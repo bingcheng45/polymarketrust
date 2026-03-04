@@ -48,6 +48,8 @@ const DISCOVERY_RETRY_DEGRADED_STEP_SECS: u64 = 5;
 const DISCOVERY_RETRY_DEGRADED_STEP_WINDOW_SECS: u64 = 60;
 const DISCOVERY_RETRY_MAX_SECS: u64 = 30;
 const DISCOVERY_PROBE_INTERVAL_SECS: u64 = 20;
+const DISCOVERY_LAST_GOOD_TTL_SECS: u64 = 180;
+const DISCOVERY_FALLBACK_MIN_REMAINING_SECS: u64 = 30;
 // Claimability polling fallback interval.
 const CLAIM_POLL_INTERVAL_SECS: u64 = 5;
 const CLAIM_FAILURE_BACKOFF_SECS: u64 = 30;
@@ -159,6 +161,8 @@ pub struct MarketMonitor {
 
     // Active market
     market_info: Option<MarketInfo>,
+    last_good_market: Option<MarketInfo>,
+    last_good_market_at: Option<Instant>,
 
     // Position state
     position: Position,
@@ -315,6 +319,8 @@ impl MarketMonitor {
             maker,
             post_only,
             market_info: None,
+            last_good_market: None,
+            last_good_market_at: None,
             cached_fee_rate_bps: 0,
             position: Position::default(),
             session_locked_value: 0.0,
@@ -569,6 +575,7 @@ impl MarketMonitor {
                         fee_bps, max_fee_pct
                     )).await;
                     
+                    self.cache_last_good_market(&mi);
                     self.market_info = Some(mi);
                     return Ok(true);
                 }
@@ -586,6 +593,13 @@ impl MarketMonitor {
         // Distinguish "no market exists" from "all discovery calls failed".
         if !had_successful_lookup {
             if let Some(e) = last_lookup_error {
+                let reason = Self::format_error_chain(&e);
+                if self
+                    .try_last_good_market_fallback(&reason)
+                    .await
+                {
+                    return Ok(true);
+                }
                 return Err(e).context("all market discovery lookups failed");
             }
         }
@@ -852,6 +866,63 @@ impl MarketMonitor {
         }
 
         self.request_render();
+    }
+
+    fn cache_last_good_market(&mut self, market: &MarketInfo) {
+        self.last_good_market = Some(market.clone());
+        self.last_good_market_at = Some(Instant::now());
+    }
+
+    fn select_last_good_market_fallback(&self) -> Option<(MarketInfo, u64, i64)> {
+        let cached_market = self.last_good_market.clone()?;
+        let cached_at = self.last_good_market_at?;
+        let cache_age_secs = cached_at.elapsed().as_secs();
+        let cache_ttl_secs = Self::env_u64(
+            "DISCOVERY_LAST_GOOD_TTL_SECS",
+            DISCOVERY_LAST_GOOD_TTL_SECS,
+        )
+        .max(10);
+        if cache_age_secs > cache_ttl_secs {
+            return None;
+        }
+
+        let min_remaining_secs = Self::env_u64(
+            "DISCOVERY_FALLBACK_MIN_REMAINING_SECS",
+            DISCOVERY_FALLBACK_MIN_REMAINING_SECS,
+        )
+        .max((EXPIRY_BUFFER_SECS + 1).max(1) as u64);
+        let remaining_secs = (cached_market.end_date - Utc::now()).num_seconds();
+        if remaining_secs <= min_remaining_secs as i64 {
+            return None;
+        }
+
+        Some((cached_market, cache_age_secs, remaining_secs))
+    }
+
+    async fn try_last_good_market_fallback(&mut self, reason: &str) -> bool {
+        let Some((market, cache_age_secs, remaining_secs)) = self.select_last_good_market_fallback() else {
+            return false;
+        };
+
+        let fee_bps = self
+            .client
+            .get_market_fee_rate_bps(&market.tokens.yes)
+            .await
+            .unwrap_or(self.cached_fee_rate_bps);
+        self.cached_fee_rate_bps = fee_bps;
+        self.market_info = Some(market.clone());
+
+        warn!(
+            "Using cached market fallback due to discovery failure: market='{}' remaining={}s cache_age={}s reason={}",
+            market.question, remaining_secs, cache_age_secs, reason
+        );
+        self.log_action(&format!(
+            "🛟 Discovery fallback: using cached market ({}s left, cache age {}s).",
+            remaining_secs, cache_age_secs
+        ))
+        .await;
+
+        true
     }
 
     async fn connect_ws_for_active_market(&mut self, is_reconnect: bool) {
@@ -5912,6 +5983,8 @@ mod tests {
             maker: None,
             post_only: None,
             market_info: None,
+            last_good_market: None,
+            last_good_market_at: None,
             position: Position::default(),
             session_locked_value: 0.0,
             session_start_balance: 1000.0, // Mock balance
