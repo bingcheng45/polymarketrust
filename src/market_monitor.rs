@@ -44,6 +44,9 @@ const MERGE_RETRY_SECS: u64 = 30;
 const MAX_HEDGE_COOLDOWN_SECS: u64 = 120;
 // Retry interval when no active market is available yet.
 const MARKET_DISCOVERY_RETRY_SECS: u64 = 5;
+const DISCOVERY_RETRY_DEGRADED_STEP_SECS: u64 = 5;
+const DISCOVERY_RETRY_DEGRADED_STEP_WINDOW_SECS: u64 = 60;
+const DISCOVERY_RETRY_MAX_SECS: u64 = 30;
 // Claimability polling fallback interval.
 const CLAIM_POLL_INTERVAL_SECS: u64 = 5;
 const CLAIM_FAILURE_BACKOFF_SECS: u64 = 30;
@@ -454,9 +457,10 @@ impl MarketMonitor {
                 }
                 Ok(false) => {
                     self.clear_discovery_degraded_state();
+                    let retry_secs = self.discovery_retry_secs();
                     self.log_action(&format!(
                         "⏳ No active market yet. Retrying in {}s...",
-                        MARKET_DISCOVERY_RETRY_SECS
+                        retry_secs
                     ))
                     .await;
                 }
@@ -465,16 +469,17 @@ impl MarketMonitor {
                     if self.discovery_failure_since.is_none() {
                         self.discovery_failure_since = Some(Instant::now());
                     }
+                    let retry_secs = self.discovery_retry_secs();
                     let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
                     self.log_action(&format!(
                         "⚠️ Market discovery failed (retrying in {}s): {}",
-                        MARKET_DISCOVERY_RETRY_SECS, reason
+                        retry_secs, reason
                     ))
                     .await;
                     self.maybe_log_discovery_degraded().await;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(MARKET_DISCOVERY_RETRY_SECS)).await;
+            tokio::time::sleep(Duration::from_secs(self.discovery_retry_secs())).await;
         }
 
         // 4. Recover prior trade history now that market_info is known.
@@ -581,9 +586,27 @@ impl MarketMonitor {
         Ok(false)
     }
 
+    fn discovery_retry_secs(&self) -> u64 {
+        let base = MARKET_DISCOVERY_RETRY_SECS.max(1);
+        let Some(first_failure) = self.discovery_failure_since else {
+            return base;
+        };
+        let elapsed = first_failure.elapsed().as_secs();
+        if elapsed < self.config.discovery_degraded_secs {
+            return base;
+        }
+
+        let degraded_elapsed = elapsed.saturating_sub(self.config.discovery_degraded_secs);
+        let steps = degraded_elapsed / DISCOVERY_RETRY_DEGRADED_STEP_WINDOW_SECS + 1;
+        let backoff = base
+            .saturating_add(steps.saturating_mul(DISCOVERY_RETRY_DEGRADED_STEP_SECS))
+            .min(DISCOVERY_RETRY_MAX_SECS);
+        backoff.max(base)
+    }
+
     fn market_discovery_due(&self) -> bool {
         self.last_market_discovery_attempt
-            .map(|t| t.elapsed().as_secs() >= MARKET_DISCOVERY_RETRY_SECS)
+            .map(|t| t.elapsed().as_secs() >= self.discovery_retry_secs())
             .unwrap_or(true)
     }
 
@@ -606,9 +629,10 @@ impl MarketMonitor {
             .unwrap_or(true);
         if warn_due {
             self.last_discovery_degraded_warn_at = Some(Instant::now());
+            let retry_secs = self.discovery_retry_secs();
             self.log_action(&format!(
-                "⚠️ Discovery degraded >{}s: Gamma /events + /markets failing. Holding in retry mode.",
-                self.config.discovery_degraded_secs
+                "⚠️ Discovery degraded >{}s: Gamma /events + /markets failing. Holding in retry mode ({}s).",
+                self.config.discovery_degraded_secs, retry_secs
             ))
             .await;
         }
@@ -704,9 +728,10 @@ impl MarketMonitor {
             }
             Ok(false) => {
                 self.clear_discovery_degraded_state();
+                let retry_secs = self.discovery_retry_secs();
                 self.log_action(&format!(
                     "⏳ No active market yet. Retrying in {}s...",
-                    MARKET_DISCOVERY_RETRY_SECS
+                    retry_secs
                 ))
                 .await;
             }
@@ -715,10 +740,11 @@ impl MarketMonitor {
                 if self.discovery_failure_since.is_none() {
                     self.discovery_failure_since = Some(Instant::now());
                 }
+                let retry_secs = self.discovery_retry_secs();
                 let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
                 self.log_action(&format!(
                     "⚠️ Market discovery failed (retrying in {}s): {}",
-                    MARKET_DISCOVERY_RETRY_SECS, reason
+                    retry_secs, reason
                 ))
                 .await;
                 self.maybe_log_discovery_degraded().await;
@@ -3750,9 +3776,10 @@ impl MarketMonitor {
             }
             Ok(false) => {
                 self.clear_discovery_degraded_state();
+                let retry_secs = self.discovery_retry_secs();
                 self.log_action(&format!(
                     "⏳ No active market yet. Waiting for next window (retry {}s)...",
-                    MARKET_DISCOVERY_RETRY_SECS
+                    retry_secs
                 ))
                 .await;
                 return;
@@ -3762,10 +3789,11 @@ impl MarketMonitor {
                 if self.discovery_failure_since.is_none() {
                     self.discovery_failure_since = Some(Instant::now());
                 }
+                let retry_secs = self.discovery_retry_secs();
                 let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
                 self.log_action(&format!(
                     "⚠️ Failed to discover next market (retry {}s): {}",
-                    MARKET_DISCOVERY_RETRY_SECS, reason
+                    retry_secs, reason
                 ))
                 .await;
                 self.maybe_log_discovery_degraded().await;
