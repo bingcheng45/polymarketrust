@@ -1,6 +1,78 @@
-# polymarketrust
+# PolymarketTrust
 
-A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScript logic from [`polymarket`](../polymarket) into idiomatic Rust, using `tokio` for async I/O and on-chain interactions.
+![Rust](https://img.shields.io/badge/Rust-Async%20Tokio-black?logo=rust)
+![Polymarket](https://img.shields.io/badge/Market-Polymarket-blue)
+![Strategy](https://img.shields.io/badge/Mode-Arbitrage%20%2B%20Market%20Making-green)
+![License](https://img.shields.io/badge/License-MIT-lightgrey)
+
+**PolymarketTrust** is a production-minded **Rust trading bot for Polymarket**.  
+It monitors live BTC Up/Down orderbooks, finds fee-adjusted edges, executes paired orders, and auto-recovers from partial fills to keep risk controlled.
+
+If you are looking for a **Polymarket bot**, **Rust arbitrage bot**, or a practical codebase for **automated prediction market execution**, this project is built for that.
+
+## What This Bot Does on Polymarket
+
+- Scans active markets in real time over WebSocket.
+- Prices opportunities after fees, liquidity, and execution constraints.
+- Trades only when expected edge is above configured thresholds.
+- Handles partial fills with hedge-or-sell-back recovery logic.
+- Tracks claimable payouts and redeems settled positions.
+- Self-heals during disconnects, degraded discovery, and runtime wake events.
+
+## Table of Contents
+
+- [Why People Try This Bot](#why-people-try-this-bot)
+- [Strategy in Plain English](#strategy-in-plain-english)
+- [Why It Can Work](#why-it-can-work)
+- [Important Risk Note](#important-risk-note)
+- [FAQ](#faq)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Runtime Logic UML](#runtime-logic-uml)
+- [Fee Formula](#fee-formula)
+- [Known Logic Gaps](#known-logic-gaps)
+- [Security](#security)
+- [License](#license)
+
+## Why People Try This Bot
+
+- **Fast event-driven engine** built with `tokio` for low-latency market reaction.
+- **Risk-first behavior** with strict neutrality lock, hedge recovery, and circuit breakers.
+- **Production-minded operations** including reconnect handling, degraded discovery recovery, and claim automation.
+- **Transparent logs and stats** so you can audit what happened and improve the strategy over time.
+
+## Strategy in Plain English
+
+1. Read real-time Up/Down prices from WebSocket (with REST fallback).
+2. Check if buying both sides (or posting one side) still leaves a fee-adjusted edge.
+3. Execute in controlled slices, then reconcile partial fills immediately.
+4. Keep inventory near-neutral and redeem settled outcomes to realize cashflow.
+
+## Why It Can Work
+
+- Short-window markets can temporarily misprice relative to fee-adjusted fair bounds.
+- Real-time execution plus fast reconciliation can capture small edges repeatedly.
+- Discipline on entry filters and loss controls is more important than prediction accuracy.
+
+## Important Risk Note
+
+This is a trading system, not guaranteed income. API outages, slippage, partial fills, and market regime changes can all cause losses. Run in shadow mode first, start small, and treat this as software + risk engineering.
+
+## FAQ
+
+### Is this a guaranteed-profit bot?
+
+No. It is an execution and risk-management system that can still lose money during bad fills, latency spikes, API outages, or adverse market conditions.
+
+### Do I need to predict BTC direction?
+
+Not for the core strategy. The bot primarily targets pricing inefficiencies and execution quality, then manages residual exposure when fills are uneven.
+
+### Can I run it safely as a beginner?
+
+Yes, if you start in shadow mode (`SHADOW_ENGINE_SEND_ORDERS=false`), verify logs, test connectivity, and only then scale up with strict loss limits.
 
 ## Features
 
@@ -12,6 +84,7 @@ A Rust replication of a Polymarket arbitrage bot. This project ports the TypeScr
 - **Hedge-failure risk lock** — auto-pauses new entries when recent hedge attempts are persistently failing
 - **Hard timeout recovery lock** — ambiguous submit timeouts trigger deterministic recovery before resuming
 - **Runtime wake recovery** — detects long runtime pauses (sleep/unlock) and forces WS/discovery reconnect
+- **Discovery degraded self-heal** — periodic Gamma health probe forces rediscovery when upstream recovers
 - **WebSocket orderbook feed** — real-time updates from Polymarket's WS API with REST fallback
 - **Strategy selector** — choose `post-only` (new market-maker mode), `taker`, or legacy `maker`
 - **Dynamic fee calculation** — `fee = CLOB_FEE_RATE × (price × (1 − price))^CLOB_FEE_EXPONENT`
