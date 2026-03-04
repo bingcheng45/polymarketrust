@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
     let monitor_claim = Arc::clone(&monitor);
     let monitor_render = Arc::clone(&monitor);
     let monitor_merge_reconcile = Arc::clone(&monitor);
+    let monitor_discovery_probe = Arc::clone(&monitor);
 
     // 1. Opportunity check — WS-driven with adaptive triggering + 5s REST heartbeat fallback.
     let arb_handle = tokio::spawn(async move {
@@ -186,6 +187,15 @@ async fn main() -> Result<()> {
         }
     });
 
+    // 3b. Lightweight discovery probe in degraded mode.
+    let discovery_probe_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            MarketMonitor::run_discovery_probe_cycle(&monitor_discovery_probe).await;
+        }
+    });
+
     // 4. Balance refresh worker (every 2 seconds, outside strategy hot path)
     let balance_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
@@ -243,6 +253,7 @@ async fn main() -> Result<()> {
     arb_handle.abort();
     maker_handle.abort();
     ws_handle.abort();
+    discovery_probe_handle.abort();
     balance_handle.abort();
     gas_handle.abort();
     claim_handle.abort();

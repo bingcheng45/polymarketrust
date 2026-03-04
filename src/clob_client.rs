@@ -521,6 +521,16 @@ impl ClobClient {
     }
 
     // ─── Gamma API (Market Discovery) ────────────────────────────────────────
+    /// Lightweight Gamma health probe used by degraded-mode recovery loops.
+    /// Keeps payload tiny to avoid compounding load while infrastructure is shaky.
+    pub async fn gamma_health_check(&self) -> Result<()> {
+        let url = format!("{GAMMA_BASE}/markets?limit=1&active=true&closed=false");
+        let _: Vec<Value> = Self::fetch_gamma_payload_with_client(&self.http, &url, "markets")
+            .await
+            .with_context(|| "Gamma health probe failed")?;
+        Ok(())
+    }
+
     /// Find the active market for a slug prefix using the Gamma API.
     /// Returns the soonest-ending active market to maximise theta-decay edge.
     pub async fn find_active_market(&self, slug_prefix: &str) -> Result<Option<MarketInfo>> {

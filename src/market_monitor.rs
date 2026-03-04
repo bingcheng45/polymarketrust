@@ -47,6 +47,7 @@ const MARKET_DISCOVERY_RETRY_SECS: u64 = 5;
 const DISCOVERY_RETRY_DEGRADED_STEP_SECS: u64 = 5;
 const DISCOVERY_RETRY_DEGRADED_STEP_WINDOW_SECS: u64 = 60;
 const DISCOVERY_RETRY_MAX_SECS: u64 = 30;
+const DISCOVERY_PROBE_INTERVAL_SECS: u64 = 20;
 // Claimability polling fallback interval.
 const CLAIM_POLL_INTERVAL_SECS: u64 = 5;
 const CLAIM_FAILURE_BACKOFF_SECS: u64 = 30;
@@ -201,6 +202,7 @@ pub struct MarketMonitor {
     discovery_failure_since: Option<Instant>,
     last_discovery_degraded_warn_at: Option<Instant>,
     last_discovery_self_heal_at: Option<Instant>,
+    last_discovery_probe_at: Option<Instant>,
     force_claim_scan: bool,
     last_runtime_tick: Instant,
     last_resume_recovery_at: Option<Instant>,
@@ -281,6 +283,8 @@ pub struct MarketMonitor {
     last_hedge_outcome_at: Option<Instant>,
     last_yes_mid_price: Option<f64>,
     last_no_mid_price: Option<f64>,
+    last_no_edge_skip_key: Option<String>,
+    last_no_edge_skip_at: Option<Instant>,
     seen_rest_trade_ids: HashSet<String>,
     rest_trade_id_queue: VecDeque<String>,
 }
@@ -343,6 +347,7 @@ impl MarketMonitor {
             discovery_failure_since: None,
             last_discovery_degraded_warn_at: None,
             last_discovery_self_heal_at: None,
+            last_discovery_probe_at: None,
             force_claim_scan: false,
             last_runtime_tick: Instant::now(),
             last_resume_recovery_at: None,
@@ -410,6 +415,8 @@ impl MarketMonitor {
             last_hedge_outcome_at: None,
             last_yes_mid_price: None,
             last_no_mid_price: None,
+            last_no_edge_skip_key: None,
+            last_no_edge_skip_at: None,
             seen_rest_trade_ids: HashSet::new(),
             rest_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
         })
@@ -614,6 +621,18 @@ impl MarketMonitor {
         self.discovery_failure_since = None;
         self.last_discovery_degraded_warn_at = None;
         self.last_discovery_self_heal_at = None;
+        self.last_discovery_probe_at = None;
+    }
+
+    fn discovery_probe_due(&self) -> bool {
+        let interval_secs = Self::env_u64(
+            "DISCOVERY_PROBE_INTERVAL_SECS",
+            DISCOVERY_PROBE_INTERVAL_SECS,
+        )
+        .max(5);
+        self.last_discovery_probe_at
+            .map(|t| t.elapsed().as_secs() >= interval_secs)
+            .unwrap_or(true)
     }
 
     async fn maybe_log_discovery_degraded(&mut self) {
@@ -749,6 +768,45 @@ impl MarketMonitor {
                 .await;
                 self.maybe_log_discovery_degraded().await;
             }
+        }
+    }
+
+    pub async fn run_discovery_probe_cycle(monitor: &Arc<Mutex<Self>>) {
+        let client = {
+            let mut m = match monitor.try_lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+
+            if m.market_info.is_some() {
+                return;
+            }
+            let Some(first_failure) = m.discovery_failure_since else {
+                return;
+            };
+            if first_failure.elapsed().as_secs() < m.config.discovery_degraded_secs {
+                return;
+            }
+            if !m.discovery_probe_due() {
+                return;
+            }
+
+            m.last_discovery_probe_at = Some(Instant::now());
+            Arc::clone(&m.client)
+        };
+
+        if client.gamma_health_check().await.is_err() {
+            return;
+        }
+
+        if let Ok(mut m) = monitor.try_lock() {
+            if m.market_info.is_some() || m.discovery_failure_since.is_none() {
+                return;
+            }
+            m.log_action("✅ Discovery probe: Gamma reachable again — forcing immediate rediscovery.")
+                .await;
+            m.last_market_discovery_attempt = None;
+            m.try_find_active_market_if_due().await;
         }
     }
 
@@ -1084,9 +1142,11 @@ impl MarketMonitor {
             let resting_min_edge = Self::env_f64("RESTING_MIN_EDGE_PER_SHARE", 0.01).max(0.0);
             if net_spread < resting_min_edge {
                 self.checks_skipped_profit = self.checks_skipped_profit.saturating_add(1);
-                self.log_action_fast(&format!(
-                    "🧾 ORDER SEND: NO — resting edge ${net_spread:.3}/share below floor ${resting_min_edge:.3}/share."
-                ));
+                if self.should_log_no_edge_skip(net_spread, resting_min_edge) {
+                    self.log_action_fast(&format!(
+                        "🧾 ORDER SEND: NO — resting edge ${net_spread:.3}/share below floor ${resting_min_edge:.3}/share."
+                    ));
+                }
                 self.request_render();
                 return;
             }
@@ -2961,7 +3021,7 @@ impl MarketMonitor {
                 )
             };
 
-        let min_sell_size = Self::env_f64("MIN_IMBALANCE_SELL_SHARES", 5.0).max(5.0);
+        let min_sell_size = Self::env_f64("MIN_IMBALANCE_SELL_SHARES", 5.0).max(0.01);
         let min_buy_size = Self::env_f64("MIN_IMBALANCE_BUY_SHARES", 1.0).max(0.01);
         let mut size = yes_excess.abs().min(self.effective_max_trade_size());
         size = (size * 100.0).floor() / 100.0;
@@ -5335,6 +5395,24 @@ impl MarketMonitor {
         self.maybe_log_latency_summary();
     }
 
+    fn should_log_no_edge_skip(&mut self, net_spread: f64, resting_min_edge: f64) -> bool {
+        let cooldown_ms = Self::env_u64("NO_EDGE_LOG_COOLDOWN_MS", 1_200).max(100);
+        let key = format!("{net_spread:.3}|{resting_min_edge:.3}");
+        let recent_duplicate = self
+            .last_no_edge_skip_key
+            .as_ref()
+            .map(|prev| prev == &key)
+            .unwrap_or(false);
+        let cooldown_active = self
+            .last_no_edge_skip_at
+            .map(|t| t.elapsed() < Duration::from_millis(cooldown_ms))
+            .unwrap_or(false);
+
+        self.last_no_edge_skip_key = Some(key);
+        self.last_no_edge_skip_at = Some(Instant::now());
+        !(recent_duplicate && cooldown_active)
+    }
+
     fn push_latency_sample(samples: &mut VecDeque<u64>, elapsed: Duration) {
         let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
         Self::push_latency_value(samples, ms);
@@ -5865,6 +5943,7 @@ mod tests {
             discovery_failure_since: None,
             last_discovery_degraded_warn_at: None,
             last_discovery_self_heal_at: None,
+            last_discovery_probe_at: None,
             force_claim_scan: false,
             last_runtime_tick: Instant::now(),
             last_resume_recovery_at: None,
@@ -5933,6 +6012,8 @@ mod tests {
             last_hedge_outcome_at: None,
             last_yes_mid_price: None,
             last_no_mid_price: None,
+            last_no_edge_skip_key: None,
+            last_no_edge_skip_at: None,
             seen_rest_trade_ids: HashSet::new(),
             rest_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
         })
