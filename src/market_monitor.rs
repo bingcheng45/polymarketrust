@@ -109,6 +109,8 @@ const HEDGE_FAILURE_LOCK_TTL_SECS: u64 = 300;
 const REST_RECOVERY_POLL_LOOKBACK_MAX_TRADES: usize = 200;
 const RUNTIME_RESUME_GAP_SECS: u64 = 20;
 const RUNTIME_RESUME_RECOVERY_DEBOUNCE_SECS: u64 = 15;
+const RESTING_ENTRY_CUTOFF_SECS: u64 = 75;
+const RESTING_EXPIRY_GUARD_LOG_INTERVAL_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryLockReason {
@@ -291,6 +293,7 @@ pub struct MarketMonitor {
     last_no_mid_price: Option<f64>,
     last_no_edge_skip_key: Option<String>,
     last_no_edge_skip_at: Option<Instant>,
+    last_resting_expiry_guard_log_at: Option<Instant>,
     seen_rest_trade_ids: HashSet<String>,
     rest_trade_id_queue: VecDeque<String>,
 }
@@ -425,6 +428,7 @@ impl MarketMonitor {
             last_no_mid_price: None,
             last_no_edge_skip_key: None,
             last_no_edge_skip_at: None,
+            last_resting_expiry_guard_log_at: None,
             seen_rest_trade_ids: HashSet::new(),
             rest_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
         })
@@ -480,12 +484,12 @@ impl MarketMonitor {
                     .await;
                 }
                 Err(e) => {
-                    warn!("Market discovery error during init: {e}");
+                    warn!("Market discovery error during init: {e:#}");
                     if self.discovery_failure_since.is_none() {
                         self.discovery_failure_since = Some(Instant::now());
                     }
                     let retry_secs = self.discovery_retry_secs();
-                    let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
+                    let reason = Self::summarize_error_for_action(&e, 220);
                     self.log_action(&format!(
                         "⚠️ Market discovery failed (retrying in {}s): {}",
                         retry_secs, reason
@@ -704,8 +708,8 @@ impl MarketMonitor {
                     .await;
             }
             Err(e) => {
-                warn!("Discovery self-heal failed to rebuild CLOB client: {e}");
-                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
+                warn!("Discovery self-heal failed to rebuild CLOB client: {e:#}");
+                let reason = Self::summarize_error_for_action(&e, 220);
                 self.log_action(&format!(
                     "⚠️ Discovery self-heal failed: client rebuild error: {reason}"
                 ))
@@ -740,8 +744,8 @@ impl MarketMonitor {
                     .await;
             }
             Err(e) => {
-                warn!("Discovery self-heal rediscovery attempt failed: {e}");
-                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
+                warn!("Discovery self-heal rediscovery attempt failed: {e:#}");
+                let reason = Self::summarize_error_for_action(&e, 220);
                 self.log_action(&format!(
                     "⚠️ Discovery self-heal rediscovery failed: {reason}"
                 ))
@@ -771,12 +775,12 @@ impl MarketMonitor {
                 .await;
             }
             Err(e) => {
-                warn!("Market discovery error: {e}");
+                warn!("Market discovery error: {e:#}");
                 if self.discovery_failure_since.is_none() {
                     self.discovery_failure_since = Some(Instant::now());
                 }
                 let retry_secs = self.discovery_retry_secs();
-                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
+                let reason = Self::summarize_error_for_action(&e, 220);
                 self.log_action(&format!(
                     "⚠️ Market discovery failed (retrying in {}s): {}",
                     retry_secs, reason
@@ -1212,6 +1216,21 @@ impl MarketMonitor {
         }
 
         if self.config.uses_resting_orders() {
+            let resting_entry_cutoff_secs =
+                Self::env_u64("RESTING_ENTRY_CUTOFF_SECS", RESTING_ENTRY_CUTOFF_SECS)
+                    .max((EXPIRY_BUFFER_SECS + 1).max(1) as u64);
+            if secs_to_expiry <= resting_entry_cutoff_secs as i64 {
+                if self.should_log_resting_expiry_guard() {
+                    self.log_action_fast(&format!(
+                        "🧾 ORDER SEND: NO — resting entry guard active ({}s to expiry <= {}s cutoff).",
+                        secs_to_expiry.max(0),
+                        resting_entry_cutoff_secs
+                    ));
+                }
+                self.request_render();
+                return;
+            }
+
             let resting_min_edge = Self::env_f64("RESTING_MIN_EDGE_PER_SHARE", 0.01).max(0.0);
             if net_spread < resting_min_edge {
                 self.checks_skipped_profit = self.checks_skipped_profit.saturating_add(1);
@@ -3958,12 +3977,12 @@ impl MarketMonitor {
                 return;
             }
             Err(e) => {
-                warn!("Failed to find next market: {e}");
+                warn!("Failed to find next market: {e:#}");
                 if self.discovery_failure_since.is_none() {
                     self.discovery_failure_since = Some(Instant::now());
                 }
                 let retry_secs = self.discovery_retry_secs();
-                let reason = Self::truncate_for_action(&Self::format_error_chain(&e), 220);
+                let reason = Self::summarize_error_for_action(&e, 220);
                 self.log_action(&format!(
                     "⚠️ Failed to discover next market (retry {}s): {}",
                     retry_secs, reason
@@ -5089,6 +5108,31 @@ impl MarketMonitor {
         out
     }
 
+    fn summarize_error_for_action(error: &anyhow::Error, max_chars: usize) -> String {
+        let chain = error
+            .chain()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>();
+        let full = chain.join(" | ");
+        if full.chars().count() <= max_chars {
+            return full;
+        }
+
+        let root = chain.last().cloned().unwrap_or_else(|| "unknown".to_string());
+        let suffix = format!(" | root: {root}");
+        let mut budget = max_chars.saturating_sub(suffix.chars().count() + 3);
+        if budget < 40 {
+            budget = max_chars.saturating_sub(3);
+            let mut head = full.chars().take(budget).collect::<String>();
+            head.push_str("...");
+            return head;
+        }
+        let mut head = full.chars().take(budget).collect::<String>();
+        head.push_str("...");
+        head.push_str(&suffix);
+        head
+    }
+
     fn is_balance_allowance_rejection(error: &anyhow::Error) -> bool {
         let msg = Self::format_error_chain(error).to_ascii_lowercase();
         msg.contains("not enough balance")
@@ -5619,6 +5663,17 @@ impl MarketMonitor {
         self.last_no_edge_skip_key = Some(key);
         self.last_no_edge_skip_at = Some(Instant::now());
         !(recent_duplicate && cooldown_active)
+    }
+
+    fn should_log_resting_expiry_guard(&mut self) -> bool {
+        let due = self
+            .last_resting_expiry_guard_log_at
+            .map(|t| t.elapsed().as_secs() >= RESTING_EXPIRY_GUARD_LOG_INTERVAL_SECS)
+            .unwrap_or(true);
+        if due {
+            self.last_resting_expiry_guard_log_at = Some(Instant::now());
+        }
+        due
     }
 
     fn push_latency_sample(samples: &mut VecDeque<u64>, elapsed: Duration) {
@@ -6224,6 +6279,7 @@ mod tests {
             last_no_mid_price: None,
             last_no_edge_skip_key: None,
             last_no_edge_skip_at: None,
+            last_resting_expiry_guard_log_at: None,
             seen_rest_trade_ids: HashSet::new(),
             rest_trade_id_queue: VecDeque::with_capacity(MAX_SEEN_WS_TRADE_IDS + 1),
         })

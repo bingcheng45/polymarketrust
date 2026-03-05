@@ -586,10 +586,24 @@ impl ClobClient {
             ("no_tag", false, None),
         ];
 
-        let mut seen_event_urls = HashSet::new();
         let mut had_successful_gamma_response = false;
         let mut last_gamma_error: Option<anyhow::Error> = None;
 
+        // Fast-path for recurring up/down markets where slug = "<prefix>-<epoch>".
+        // A handful of direct slug probes is lighter than full /events or /markets scans.
+        match self
+            .find_recurring_market_by_slug_probe(&slug_prefix, min_end_date)
+            .await
+        {
+            Ok(Some(info)) => return Ok(Some(info)),
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Recurring slug probe failed for '{slug_prefix}': {e:#}");
+                last_gamma_error = Some(e);
+            }
+        }
+
+        let mut seen_event_urls = HashSet::new();
         for (label, with_end_date_min, with_tag_id) in query_plan {
             let url = build_events_url(with_end_date_min, with_tag_id);
             if !seen_event_urls.insert(url.clone()) {
@@ -603,7 +617,7 @@ impl ClobClient {
                 }
                 Err(e) => {
                     warn!(
-                        "Gamma discovery query '{label}' failed for slug '{slug_prefix}': {e}"
+                        "Gamma discovery query '{label}' failed for slug '{slug_prefix}': {e:#}"
                     );
                     last_gamma_error = Some(e);
                     continue;
@@ -640,7 +654,7 @@ impl ClobClient {
                 }
                 Err(e) => {
                     warn!(
-                        "Gamma markets discovery query '{label}' failed for slug '{slug_prefix}': {e}"
+                        "Gamma markets discovery query '{label}' failed for slug '{slug_prefix}': {e:#}"
                     );
                     last_market_error = Some(e);
                     continue;
@@ -667,6 +681,60 @@ impl ClobClient {
             }
         }
 
+        Ok(None)
+    }
+
+    async fn find_recurring_market_by_slug_probe(
+        &self,
+        slug_prefix: &str,
+        min_end_date: DateTime<Utc>,
+    ) -> Result<Option<MarketInfo>> {
+        let Some(step_secs) = recurring_market_step_secs(slug_prefix) else {
+            return Ok(None);
+        };
+
+        let mut best: Option<(MarketInfo, DateTime<Utc>)> = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        for ts in recurring_market_candidate_timestamps(Utc::now().timestamp(), step_secs) {
+            if ts <= 0 {
+                continue;
+            }
+            let candidate_slug = format!("{slug_prefix}-{ts}");
+            let url = format!("{GAMMA_BASE}/markets/slug/{candidate_slug}");
+            match self.fetch_gamma_payload::<GammaMarket>(&url, "markets").await {
+                Ok(market) => {
+                    if market.closed.unwrap_or(false) {
+                        continue;
+                    }
+                    let Some(end_date) = parse_market_end_date(market.end_date.as_deref()) else {
+                        continue;
+                    };
+                    if end_date <= min_end_date {
+                        continue;
+                    }
+                    if let Some(info) = market_info_from_gamma_market(market, end_date) {
+                        match &best {
+                            Some((_, best_end)) if *best_end <= end_date => {}
+                            _ => best = Some((info, end_date)),
+                        }
+                    }
+                }
+                Err(e) => {
+                    if is_gamma_http_404(&e) {
+                        continue;
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        if let Some((info, _)) = best {
+            return Ok(Some(info));
+        }
+        if let Some(err) = last_err {
+            return Err(err)
+                .context(format!("recurring slug probe failed for prefix '{slug_prefix}'"));
+        }
         Ok(None)
     }
 
@@ -1243,6 +1311,33 @@ fn parse_market_end_date(raw: Option<&str>) -> Option<DateTime<Utc>> {
     raw.and_then(|s| s.parse::<DateTime<Utc>>().ok())
 }
 
+fn recurring_market_step_secs(slug_prefix: &str) -> Option<i64> {
+    if slug_prefix.contains("updown-5m") {
+        Some(300)
+    } else if slug_prefix.contains("updown-15m") {
+        Some(900)
+    } else {
+        None
+    }
+}
+
+fn recurring_market_candidate_timestamps(now_ts: i64, step_secs: i64) -> Vec<i64> {
+    if step_secs <= 0 {
+        return Vec::new();
+    }
+    let base = now_ts.div_euclid(step_secs) * step_secs;
+    [-1i64, 0, 1, 2, 3, 4]
+        .into_iter()
+        .map(|offset| base + offset * step_secs)
+        .collect()
+}
+
+fn is_gamma_http_404(err: &anyhow::Error) -> bool {
+    err.chain()
+        .map(std::string::ToString::to_string)
+        .any(|part| part.contains("HTTP 404"))
+}
+
 fn market_info_from_gamma_market(market: GammaMarket, end_date: DateTime<Utc>) -> Option<MarketInfo> {
     let clob_token_ids_str = market.clob_token_ids.as_deref()?;
     let (yes, no) = extract_binary_token_pair(clob_token_ids_str, market.outcomes.as_deref())?;
@@ -1476,5 +1571,29 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].0.slug.as_deref(), Some("btc-updown-5m-1"));
         assert_eq!(selected[1].0.slug.as_deref(), Some("btc-updown-5m-2"));
+    }
+
+    #[test]
+    fn recurring_market_candidates_cover_current_and_next_windows() {
+        let now_ts = 1_772_733_155_i64; // around a 5m boundary
+        let candidates = recurring_market_candidate_timestamps(now_ts, 300);
+        assert_eq!(
+            candidates,
+            vec![
+                1_772_732_700,
+                1_772_733_000,
+                1_772_733_300,
+                1_772_733_600,
+                1_772_733_900,
+                1_772_734_200
+            ]
+        );
+    }
+
+    #[test]
+    fn recurring_market_step_inference_matches_supported_prefixes() {
+        assert_eq!(recurring_market_step_secs("btc-updown-5m"), Some(300));
+        assert_eq!(recurring_market_step_secs("eth-updown-15m"), Some(900));
+        assert_eq!(recurring_market_step_secs("some-other-market"), None);
     }
 }
