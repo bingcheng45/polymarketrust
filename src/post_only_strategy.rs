@@ -193,6 +193,10 @@ impl PostOnlyStrategy {
         self.yes_order_id.is_some() || self.no_order_id.is_some()
     }
 
+    pub fn last_quote_prices(&self) -> (Option<f64>, Option<f64>) {
+        (self.last_yes_price, self.last_no_price)
+    }
+
     fn quote_order_size(&self, yes_price: f64, no_price: f64, balance_usdc: f64) -> f64 {
         let min_sellable = std::env::var("MIN_PAIRED_SHARES")
             .ok()
@@ -211,10 +215,34 @@ impl PostOnlyStrategy {
         if hard_cap + 1e-9 < min_gross_for_sellable {
             return 0.0;
         }
-        self.config
+        let quoted_size = self
+            .config
             .min_liquidity_size
             .max(min_gross_for_sellable)
-            .min(hard_cap)
+            .min(hard_cap);
+        if quoted_size <= 0.0 {
+            return 0.0;
+        }
+
+        // Guard against one-sided fills that cannot be neutralized:
+        // if quote is below sell-back floor and the cheap-leg BUY notional
+        // is below marketable floor, skip the quote.
+        let min_sell_size = std::env::var("MIN_IMBALANCE_SELL_SHARES")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(5.0)
+            .max(0.01);
+        let min_buy_notional = std::env::var("MIN_MARKETABLE_BUY_NOTIONAL_USD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .max(0.01);
+        let cheap_leg_notional = quoted_size * yes_price.min(no_price).max(0.000_001);
+        if quoted_size + 1e-9 < min_sell_size && cheap_leg_notional + 1e-9 < min_buy_notional {
+            return 0.0;
+        }
+
+        quoted_size
     }
 
     fn net_size_after_fee(&self, gross_size: f64, price: f64) -> f64 {

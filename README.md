@@ -149,6 +149,7 @@ Key parameters:
 | `MIN_RESCUE_BUY_SHARES` | `1` | Minimum BUY hedge size for partial-fill rescue paths |
 | `MIN_IMBALANCE_BUY_SHARES` | `1` | Minimum BUY hedge size for imbalance neutralization |
 | `MIN_IMBALANCE_SELL_SHARES` | `5` | Minimum SELL hedge size for imbalance sell-back paths |
+| `MIN_MARKETABLE_BUY_NOTIONAL_USD` | `1.0` | Minimum BUY quote notional floor used to avoid CLOB invalid-amount rejections |
 | `MIN_NET_PROFIT_USD` | `0.08` | Minimum profit threshold |
 | `RESTING_MIN_EDGE_PER_SHARE` | `0.01` | Minimum edge floor for `maker`/`post-only` quote posting |
 | `STRICT_NEUTRAL_MODE` | `true` | Block new entries while imbalance/recovery lock is active |
@@ -183,6 +184,7 @@ Key parameters:
 | `SHADOW_ENGINE_ENABLED` | `true` | Enable shadow-mode execution path |
 | `SHADOW_ENGINE_SEND_ORDERS` | `false` | If `false`, model decisions but do not send orders |
 | `MERGE_RECONCILE_INTERVAL_SECS` | `5` | Merge reconciliation cadence |
+| `RECONCILE_DRIFT_SPIKE_SHARES` | `25` | Hard-sync threshold for large in-memory vs on-chain position drift spikes |
 | `MAX_DAILY_LOSS_USD` | `10.0` | Daily loss circuit breaker |
 
 ### Live Trading vs Shadow Mode

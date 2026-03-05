@@ -50,6 +50,7 @@ const DISCOVERY_RETRY_MAX_SECS: u64 = 30;
 const DISCOVERY_PROBE_INTERVAL_SECS: u64 = 20;
 const DISCOVERY_LAST_GOOD_TTL_SECS: u64 = 180;
 const DISCOVERY_FALLBACK_MIN_REMAINING_SECS: u64 = 30;
+const MIN_MARKETABLE_BUY_NOTIONAL_USD: f64 = 1.0;
 // Claimability polling fallback interval.
 const CLAIM_POLL_INTERVAL_SECS: u64 = 5;
 const CLAIM_FAILURE_BACKOFF_SECS: u64 = 30;
@@ -86,6 +87,7 @@ const RECONCILE_DUST_SYNC_STREAK: u32 = 3;
 const RECONCILE_NONZERO_SYNC_STREAK: u32 = 3;
 const RECONCILE_ZERO_SYNC_STREAK: u32 = 6;
 const RECONCILE_ZERO_SYNC_GRACE_SECS: u64 = 180;
+const RECONCILE_DRIFT_SPIKE_SHARES: f64 = 25.0;
 const ENTRY_LOCK_RECONCILE_DRIFT_STREAK: u32 = 2;
 const ENTRY_LOCK_LOG_INTERVAL_SECS: u64 = 5;
 const DISCOVERY_DEGRADED_WARN_INTERVAL_SECS: u64 = 60;
@@ -2699,6 +2701,19 @@ impl MarketMonitor {
                 ));
                 continue;
             };
+            let hedge_notional = hedge_order_size * hedge_buy_price;
+            let min_buy_notional = Self::marketable_buy_notional_floor_usd();
+            if hedge_notional + 1e-9 < min_buy_notional {
+                last_error = Some(anyhow!(
+                    "{} hedge below marketable BUY notional floor: ${:.2} < ${:.2} (size {:.2} @ {:.3})",
+                    context_label,
+                    hedge_notional,
+                    min_buy_notional,
+                    hedge_order_size,
+                    hedge_buy_price
+                ));
+                continue;
+            }
 
             let hedge_order = match self
                 .run_sdk_call(
@@ -2896,9 +2911,21 @@ impl MarketMonitor {
             0.0
         };
         let sell_pnl = expected_sell_proceeds - sell_cost_basis;
+        let min_buy_notional = Self::marketable_buy_notional_floor_usd();
+        let hedge_notional_est = hedge_quote_size_for_estimate * (missing_price * 1.06).min(1.0);
+        let hedge_buy_infeasible = hedge_notional_est + 1e-9 < min_buy_notional;
+        let force_sell_back_dust = !can_sell_back && hedge_buy_infeasible && sellable_size > 0.0;
+        if force_sell_back_dust {
+            can_sell_back = true;
+            self.log_action(&format!(
+                "🧩 Rescue fallback: BUY hedge notional ${:.2} below ${:.2} floor; forcing dust sell-back {:.3} shares.",
+                hedge_notional_est, min_buy_notional, sellable_size
+            ))
+            .await;
+        }
 
-        let sold_back = can_sell_back && sell_pnl >= hedge_pnl;
-        if !can_sell_back {
+        let sold_back = force_sell_back_dust || (can_sell_back && sell_pnl >= hedge_pnl);
+        if !can_sell_back && !force_sell_back_dust {
             self.log_action(&format!(
                 "⏭ Rescue sell-back skipped: sellable {:.3} < min {:.1} shares; forcing BUY hedge.",
                 sellable_size, min_sell_size
@@ -3199,6 +3226,21 @@ impl MarketMonitor {
                 return;
             }
         }
+        let min_buy_notional = Self::marketable_buy_notional_floor_usd();
+        let hedge_notional_est = hedge_quote_size_for_estimate * (missing_price * 1.06).min(1.0);
+        let hedge_buy_infeasible = hedge_notional_est + 1e-9 < min_buy_notional;
+        let force_sell_back_dust = !can_sell_back
+            && !sell_back_blocked_by_relayer
+            && hedge_buy_infeasible
+            && sell_size > 0.0;
+        if force_sell_back_dust {
+            can_sell_back = true;
+            self.log_action(&format!(
+                "🧩 Imbalance fallback: BUY hedge notional ${:.2} below ${:.2} floor; forcing dust sell-back {:.3} shares.",
+                hedge_notional_est, min_buy_notional, sell_size
+            ))
+            .await;
+        }
 
         // Hard loss guard: avoid forcing a hedge/sell-back when projected
         // outcomes are too negative. Near expiry, bypass to reduce hard carry.
@@ -3224,9 +3266,9 @@ impl MarketMonitor {
             return;
         }
 
-        let sell_back = can_sell_back && sell_pnl >= hedge_pnl;
+        let sell_back = force_sell_back_dust || (can_sell_back && sell_pnl >= hedge_pnl);
 
-        if !can_sell_back && !sell_back_blocked_by_relayer {
+        if !can_sell_back && !sell_back_blocked_by_relayer && !force_sell_back_dust {
             self.log_action(&format!(
                 "⏭ Imbalance sell-back skipped: sellable {:.3} < min {:.1} shares; using BUY hedge path.",
                 sell_size, min_sell_size
@@ -3983,31 +4025,69 @@ impl MarketMonitor {
             None => return,
         };
 
-        let fills = match self.config.strategy_mode {
+        let (fills, post_only_quote_prices) = match self.config.strategy_mode {
             StrategyMode::Maker => {
                 if let Some(ref mut maker) = self.maker {
-                    maker.check_fills(&self.client, &mi.condition_id).await.ok()
+                    (maker.check_fills(&self.client, &mi.condition_id).await.ok(), (None, None))
                 } else {
-                    None
+                    (None, (None, None))
                 }
             }
             StrategyMode::PostOnly => {
                 if let Some(ref mut strategy) = self.post_only {
-                    strategy.check_fills(&self.client, &mi.condition_id).await.ok()
+                    let quote_prices = strategy.last_quote_prices();
+                    (
+                        strategy.check_fills(&self.client, &mi.condition_id).await.ok(),
+                        quote_prices,
+                    )
                 } else {
-                    None
+                    (None, (None, None))
                 }
             }
-            StrategyMode::Taker => None,
+            StrategyMode::Taker => (None, (None, None)),
         };
 
         if let Some((yes_filled, no_filled)) = fills {
             if yes_filled > 0.01 || no_filled > 0.01 {
+                let mut estimated_fill_cost = 0.0;
+                if self.config.is_post_only_mode() {
+                    let (yes_quote_px, no_quote_px) = post_only_quote_prices;
+                    if yes_filled > 0.0 {
+                        if let Some(px) = yes_quote_px {
+                            let cost =
+                                self.estimate_gross_buy_cost_from_net_fill(yes_filled, px.max(0.0));
+                            self.position.yes_cost += cost;
+                            estimated_fill_cost += cost;
+                        } else {
+                            warn!(
+                                "Post-only YES fill {:.3} arrived without cached quote price; cost basis may be understated",
+                                yes_filled
+                            );
+                        }
+                    }
+                    if no_filled > 0.0 {
+                        if let Some(px) = no_quote_px {
+                            let cost =
+                                self.estimate_gross_buy_cost_from_net_fill(no_filled, px.max(0.0));
+                            self.position.no_cost += cost;
+                            estimated_fill_cost += cost;
+                        } else {
+                            warn!(
+                                "Post-only NO fill {:.3} arrived without cached quote price; cost basis may be understated",
+                                no_filled
+                            );
+                        }
+                    }
+                }
+
                 self.position.yes_size += yes_filled;
                 self.position.no_size += no_filled;
                 self.note_position_activity();
                 self.active_assets.insert(mi.tokens.yes.clone());
                 self.active_assets.insert(mi.tokens.no.clone());
+                if estimated_fill_cost > 0.0 {
+                    self.record_execution_cashflow(-estimated_fill_cost);
+                }
 
                 let strategy_label = if self.config.is_post_only_mode() {
                     "Post-only"
@@ -4021,6 +4101,12 @@ impl MarketMonitor {
                     "✅ {strategy_label} fill: UP {yes_filled:.2} | DOWN {no_filled:.2}"
                 ))
                 .await;
+                if estimated_fill_cost > 0.0 {
+                    self.log_action(&format!(
+                        "💸 {strategy_label} fill cost (estimated): ${estimated_fill_cost:.2}"
+                    ))
+                    .await;
+                }
 
                 // Safety guard: once a resting quote starts filling, clear remaining
                 // resting orders so inventory cannot cascade while hedge/reconcile runs.
@@ -4362,6 +4448,11 @@ impl MarketMonitor {
         let in_mem_is_dust = m.position.yes_size <= RECONCILE_DUST_MAX_SHARES
             && m.position.no_size <= RECONCILE_DUST_MAX_SHARES;
         let dust_drift = yes_drift.max(no_drift);
+        let drift_spike_threshold = Self::env_f64(
+            "RECONCILE_DRIFT_SPIKE_SHARES",
+            RECONCILE_DRIFT_SPIKE_SHARES,
+        )
+        .max(RECONCILE_LARGE_DRIFT_SHARES);
         let recent_position_activity = m
             .last_position_activity_at
             .map(|t| t.elapsed() < Duration::from_secs(RECONCILE_ZERO_SYNC_GRACE_SECS))
@@ -4371,6 +4462,25 @@ impl MarketMonitor {
             && in_mem_has_position
             && in_mem_is_dust
             && dust_drift >= RECONCILE_DUST_DRIFT_MIN_SHARES;
+
+        if yes_drift >= drift_spike_threshold || no_drift >= drift_spike_threshold {
+            m.reconcile_drift_streak = ENTRY_LOCK_RECONCILE_DRIFT_STREAK;
+            m.merge_mismatch_count = m.merge_mismatch_count.saturating_add(1);
+            let in_mem_yes = m.position.yes_size;
+            let in_mem_no = m.position.no_size;
+            m.log_action_fast(&format!(
+                "🚨 Reconcile drift spike: on-chain YES/NO {:.2}/{:.2} vs in-mem {:.2}/{:.2} (threshold {:.2})",
+                yes_on_chain, no_on_chain, in_mem_yes, in_mem_no, drift_spike_threshold
+            ));
+            m.sync_position_to_on_chain(yes_on_chain, no_on_chain);
+            let synced_yes = m.position.yes_size;
+            let synced_no = m.position.no_size;
+            m.log_action_fast(&format!(
+                "🧭 Position hard-synced to on-chain YES/NO {:.2}/{:.2} after drift spike",
+                synced_yes, synced_no
+            ));
+            return;
+        }
 
         if dust_zero_sync_candidate {
             m.reconcile_drift_streak = m.reconcile_drift_streak.saturating_add(1);
@@ -4425,38 +4535,13 @@ impl MarketMonitor {
 
             // If drift persists, trust on-chain balances and force-sync in-memory state.
             if m.reconcile_drift_streak >= required_streak && !defer_zero_sync {
-                let prev_yes_size = m.position.yes_size;
-                let prev_no_size = m.position.no_size;
-                let prev_yes_cost = m.position.yes_cost;
-                let prev_no_cost = m.position.no_cost;
-
-                m.position.yes_size = yes_on_chain.max(0.0);
-                m.position.no_size = no_on_chain.max(0.0);
-                m.position.yes_cost = if m.position.yes_size <= 0.01 {
-                    0.0
-                } else if prev_yes_size > 0.0 {
-                    prev_yes_cost * (m.position.yes_size / prev_yes_size)
-                } else {
-                    prev_yes_cost
-                };
-                m.position.no_cost = if m.position.no_size <= 0.01 {
-                    0.0
-                } else if prev_no_size > 0.0 {
-                    prev_no_cost * (m.position.no_size / prev_no_size)
-                } else {
-                    prev_no_cost
-                };
-                m.pending_merge_reserved_size = m
-                    .pending_merge_reserved_size
-                    .min(m.position.mergeable_amount())
-                    .max(0.0);
+                m.sync_position_to_on_chain(yes_on_chain, no_on_chain);
                 let synced_yes = m.position.yes_size;
                 let synced_no = m.position.no_size;
                 m.log_action_fast(&format!(
                     "🧭 Position reconciled to on-chain YES/NO {:.2}/{:.2} after persistent drift",
                     synced_yes, synced_no
                 ));
-                m.note_position_activity();
                 m.reconcile_drift_streak = 0;
             }
         } else {
@@ -4542,6 +4627,11 @@ impl MarketMonitor {
         self.daily_pnl = balance - self.session_start_balance;
     }
 
+    fn record_execution_cashflow(&mut self, delta_usd: f64) {
+        self.execution_pnl += delta_usd;
+        self.sync_daily_pnl_from_components();
+    }
+
     fn record_execution_result(&mut self, pnl: f64) {
         self.execution_success_count = self.execution_success_count.saturating_add(1);
         if pnl > 0.0 {
@@ -4549,6 +4639,53 @@ impl MarketMonitor {
         }
         self.execution_pnl += pnl;
         self.sync_daily_pnl_from_components();
+    }
+
+    fn marketable_buy_notional_floor_usd() -> f64 {
+        Self::env_f64("MIN_MARKETABLE_BUY_NOTIONAL_USD", MIN_MARKETABLE_BUY_NOTIONAL_USD).max(0.01)
+    }
+
+    fn estimate_gross_buy_cost_from_net_fill(&self, net_filled: f64, price: f64) -> f64 {
+        if net_filled <= 0.0 || price <= 0.0 {
+            return 0.0;
+        }
+        let active_fee_rate = if self.cached_fee_rate_bps > 0 {
+            self.config.clob_fee_rate
+        } else {
+            0.0
+        };
+        let effective_fee = active_fee_rate * (price * (1.0 - price)).powf(self.config.clob_fee_exponent);
+        let gross_size = net_filled / (1.0 - effective_fee).max(0.000_001);
+        gross_size * price
+    }
+
+    fn sync_position_to_on_chain(&mut self, yes_on_chain: f64, no_on_chain: f64) {
+        let prev_yes_size = self.position.yes_size;
+        let prev_no_size = self.position.no_size;
+        let prev_yes_cost = self.position.yes_cost;
+        let prev_no_cost = self.position.no_cost;
+
+        self.position.yes_size = yes_on_chain.max(0.0);
+        self.position.no_size = no_on_chain.max(0.0);
+        self.position.yes_cost = if self.position.yes_size <= 0.01 {
+            0.0
+        } else if prev_yes_size > 0.0 {
+            prev_yes_cost * (self.position.yes_size / prev_yes_size)
+        } else {
+            prev_yes_cost
+        };
+        self.position.no_cost = if self.position.no_size <= 0.01 {
+            0.0
+        } else if prev_no_size > 0.0 {
+            prev_no_cost * (self.position.no_size / prev_no_size)
+        } else {
+            prev_no_cost
+        };
+        self.pending_merge_reserved_size = self
+            .pending_merge_reserved_size
+            .min(self.position.mergeable_amount())
+            .max(0.0);
+        self.note_position_activity();
     }
 
     fn update_adaptive_stability_controls(&mut self, completed: bool, pnl: f64) {
