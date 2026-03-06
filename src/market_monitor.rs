@@ -3409,10 +3409,15 @@ impl MarketMonitor {
                     Err(e) => {
                         warn!("Imbalance sell-back failed: {}", Self::format_error_chain(&e));
                         if Self::is_balance_allowance_rejection(&e) {
-                            self.hedge_cooldown_until = None;
-                            self.record_hedge_outcome(false);
+                            let retry_secs =
+                                Self::env_u64("IMBALANCE_BALANCE_RETRY_SECS", 8).max(1);
+                            self.hedge_cooldown_until =
+                                Some(Instant::now() + Duration::from_secs(retry_secs));
                             self.log_action(
-                                "⚠️ Imbalance sell-back rejected (balance/allowance). Keeping smart-hedge mode.",
+                                &format!(
+                                    "⚠️ Imbalance sell-back rejected (balance/allowance). Keeping smart-hedge mode, retry in {}s.",
+                                    retry_secs
+                                ),
                             )
                             .await;
                         } else {
